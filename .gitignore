@@ -1,0 +1,32 @@
+# Secrets - NEVER commit
+f3k_flight_unit_gps/secrets.h
+
+# Pre-edit safety copies
+*.preedit
+*.bak
+*.orig
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.map
+*.d
+
+# Arduino IDE local settings
+.vscode/
+*.code-workspace
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# Editor scratch
+*~
+*.swp
+*.swo
+.idea/

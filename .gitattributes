@@ -1,0 +1,43 @@
+# Default: normalize line endings to LF in the repo,
+# convert to native on checkout (CRLF on Windows, LF on Linux/Mac/Pi)
+* text=auto
+
+# Source code - always LF in the repo
+*.ino       text eol=lf
+*.h         text eol=lf
+*.cpp       text eol=lf
+*.c         text eol=lf
+*.lua       text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.csv       text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.js        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Shell scripts must be LF (won't run on Linux/Pi otherwise)
+*.sh        text eol=lf
+
+# Windows scripts must be CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Binary files - never touch
+*.bin       binary
+*.elf       binary
+*.hex       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.tar       binary
+*.gz        binary
+*.pdf       binary

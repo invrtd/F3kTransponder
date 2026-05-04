@@ -1,0 +1,25 @@
+# F3K Flight Unit — Custom Partition Table
+# Board:  Adafruit QT Py ESP32-S3 (#5426, No PSRAM)
+# Flash:  8 MB (64 Mbit)
+#
+# Layout:
+#   nvs      20 KB   — WiFi credentials, system config
+#   otadata   8 KB   — OTA slot tracking (unused but required by bootloader)
+#   app0      3 MB   — Application (firmware ~600KB, plenty of headroom)
+#   spiffs    4.9MB  — LittleFS log storage
+#
+# LittleFS capacity vs default:
+#   Default partition:  1.5 MB  → ~625s  at 8Hz, ~1300s at 4Hz
+#   This partition:     4.9 MB  → ~2040s at 8Hz, ~4080s at 4Hz (68 min)
+#
+# Installation:
+#   Place this file in the sketch folder alongside f3k_flight_unit_gps.ino
+#   Arduino IDE: Tools → Partition Scheme → Custom
+#   Reflash after changing partition scheme — LittleFS will be erased.
+#   Re-run f3k_config_writer to restore unit ID after reflash.
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x300000,
+spiffs,   data, spiffs,  0x310000, 0x4F0000,
