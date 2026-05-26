@@ -5,14 +5,15 @@
 
 
 // ── State machine ────────────────────────────────────────────
-// State values per F3K ICD v1.0 — must match scorer exactly
+// State values per F3K ICD v1.7 — must match scorer exactly
 enum FlightState : uint8_t {
-  STATE_GROUND      = 0,
-  STATE_LAUNCH_WIN  = 1,
-  STATE_FLIGHT      = 2,
-  STATE_LANDED      = 3,
-  STATE_CALIBRATING = 4
+  STATE_CALIBRATING = 0,
+  STATE_GROUND      = 1,
+  STATE_LAUNCH_WIN  = 2,
+  STATE_FLIGHT      = 3,
+  STATE_LANDED      = 4
 };
+
 
 
 

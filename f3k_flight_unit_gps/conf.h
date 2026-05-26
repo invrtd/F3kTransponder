@@ -42,5 +42,31 @@
 #define CONFIG_PATH     "/f3k_config.json"
 #define DEFAULT_UNIT_ID 1
 
+// ── Launch detection thresholds ──────────────────────────────
+#define LAUNCH_G_THRESHOLD    3.5f    // acceleration spike (primary trigger)
+#define LAUNCH_ALT_FT         8.0f    // barometric rise backup trigger
+#define LAUNCH_WIN_MS         5000    // confirmation window before FLIGHT
+#define NEAR_GROUND           15.0f   // altitude ceiling for launch + tilt landing
+#define MIN_FLIGHT_MS         10000   // minimum flight duration before landing fires
+#define LAND_IMPACT_G         4.0f    // impact G-spike threshold
+
+// ── Calibration & tilt ───────────────────────────────────────
+#define CAL_BUF_SIZE          50      // max samples (8 Hz × 5s ≈ 40)
+#define CAL_WINDOW_MS         5000    // 5 second calibration window
+#define CALIBRATION_MS        5000    // duration of baseline averaging
+#define TILT_CAL_STABLE_THRESHOLD  0.1f  // G variance below this = stable
+
+// ── AP mode auto-window (practice feature) ───────────────────
+#define AUTO_WINDOW_SECS      595     // 9:55 (backdated 5s for LAUNCH_WIN credit)
+
+// ── Data buffer & logging ────────────────────────────────────
+#define BUF_SIZE              10      // 1 Hz display batch (sensor ringbuffer)
+#define CAL_BUF_SIZE          50      // calibration sample buffer
+
+// ── CSV logging rates ────────────────────────────────────────
+#define LOG_HZ_SHORT          8       // ≤600s windows: 8 Hz
+#define LOG_HZ_LONG           4       // >600s windows: 4 Hz
+#define LOG_INTERVAL_SHORT    125     // ms (1000/8)
+#define LOG_INTERVAL_LONG     250     // ms (1000/4)
 
 

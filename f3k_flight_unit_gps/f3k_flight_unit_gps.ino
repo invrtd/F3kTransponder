@@ -123,8 +123,6 @@ void logts() {
     Serial.printf("[+%07lums] ", ms);
   }
 }
-const uint32_t CALIBRATION_MS  = 5000;   // duration of baseline averaging
-const int      CAL_BUF_SIZE    = 50;     // max samples (8 Hz × 5s ≈ 40)
 float          cal_buf[CAL_BUF_SIZE];
 int            cal_count        = 0;
 unsigned long  cal_start_ms     = 0;
@@ -170,7 +168,6 @@ const uint32_t WINDOW_COUNTDOWN_MS = 5000;  // 5s delay before window opens
 // so the 5-second launch confirmation period counts as flight time.
 // Duration is set to AUTO_WINDOW_SECS (9:55 = 595s by default).
 // Set to 0 to disable.
-const uint16_t AUTO_WINDOW_SECS = 595;   // 9:55 — change or set 0 to disable
 bool          window_countdown_active = false;
 unsigned long window_countdown_start  = 0;
 uint16_t      window_countdown_secs   = 0;   // pending window duration
@@ -1398,16 +1395,11 @@ void updateStateMachine(float alt_ft) {
   // Ground handling: G reaches 2.0-2.5G — IMU launch threshold raised above this
   // Soaring glider appears "at rest" on IMU — rest window duration raised to 3s
   // and gyro threshold raised above the flight median of 34dps
-  const float    LAUNCH_ALT_FT      =  8.0f;  // ft above ground → altitude launch trigger
-  const float    LAUNCH_G_THRESHOLD =  3.5f;  // G — IMU launch (raised: ground handling reaches 2-2.5G)
   const float    LANDED_ALT_FT      =  5.0f;  // ft — landing altitude threshold
-  const float    LAND_IMPACT_G      =  4.0f;  // G — hard impact (raised: avoid turbulence false triggers)
   const float    LAND_REST_G_MIN    =  0.8f;  // G — rest lower bound
   const float    LAND_REST_G_MAX    =  1.2f;  // G — rest upper bound
   const float    LAND_GYRO_DPS      = 45.0f;  // °/s — raised: flight median gyro is 34dps
-  const uint32_t LAUNCH_WIN_MS      = 5000;   // ms — confirmation window duration
   const uint32_t LAND_REST_MS       = 3000;   // ms — raised: 3s steady rest is definitive
-  const uint32_t MIN_FLIGHT_MS      = 10000;  // ms — minimum time in FLIGHT before alt landing fires
 
   static uint32_t launch_win_opened_ms  = 0;
   static uint32_t flight_started_ms     = 0;

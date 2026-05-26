@@ -1,4 +1,7 @@
-
+#pragma once
+#include <Arduino.h>
+#include "types.h"
+#include "conf.h"
 
 Config cfg = { DEFAULT_UNIT_ID, true, 240, 0 };  // safe defaults
 
@@ -14,9 +17,9 @@ float buf_pressure[BUF_SIZE];
 float buf_temperature[BUF_SIZE];
 int   buf_count = 0;
 
-// Index matches FlightState enum values per ICD v1.0
+// Index matches FlightState enum values per ICD v1.7
 const char* stateNames[] = {
-  "GROUND", "LAUNCH_WIN", "FLIGHT", "LANDED", "CALIBRATING"
+  "CALIBRATING", "GROUND", "LAUNCH_WIN", "FLIGHT", "LANDED"
 };
 
 
@@ -63,4 +66,3 @@ const uint32_t SENSOR_INTERVAL   = 125;   // ms — 8 Hz
 const uint32_t IMU_INTERVAL      = 38;    // ms — 26 Hz (1000/26 ≈ 38ms)
 const uint32_t DISPLAY_INTERVAL  = 200;   // ms — 5 Hz web update
 const uint32_t DISPLAY_OFFSET_MS = 100;   // ms stagger from scorer packet
-const int      BUF_SIZE          = 10;
