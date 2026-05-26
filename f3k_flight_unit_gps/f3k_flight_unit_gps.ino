@@ -105,6 +105,10 @@
 #include "sensors.h"    // sensor setup and reading functions
 #include "webserver.h" // AsyncWebServer setup and endpoint handlers
 #include "logger.h"
+#include "scoring.h"
+#include "network.h"  // WiFi and UDP setup and helpers
+#include "store_config.h"
+
 // ── Log timestamp helper ──────────────────────────────────────
 // Prints a timestamp prefix before every Serial log line.
 // Format: [HH:MM:SS.mmm] from GPS UTC when fix valid,
@@ -122,60 +126,6 @@ void logts() {
 }
 
 
-
-
-
-
-
-
-
-#define LITTLEFS_FULL_PCT 60         // auto-delete threshold — prune early to avoid pressure
-
-bool          window_active    = false;
-uint16_t      window_secs      = 0;   // duration from scorer command
-uint32_t      window_id        = 0;   // unique ID from scorer command
-unsigned long window_start_ms  = 0;
-unsigned long window_close_ms  = 0;   // captured atomically at window-end decision point
-bool          prune_pending    = false;
-bool          log_preopen_done = false; // log file pre-opened during prep, ready at window start
-
-// ── Contest context (ICD v1.7) ────────────────────────────────
-// Received from scorer in 0x20 bytes [8–10] and 0x21 bytes [10–12].
-// Written into CSV comment headers for human-readable context.
-uint8_t  contest_task_id   = 0;  // F3XVault flight_type_id; 0 = unknown/LL
-uint8_t  contest_round_num = 0;  // 1-based; 0 = unknown
-uint8_t  contest_group_num = 0;  // 1-based; 0 = unknown
-
-// Task name lookup table keyed by task_id (F3XVault flight_type_id)
-// Returns human-readable string for CSV headers.
-const char* taskName(uint8_t tid) {
-  switch (tid) {
-    case  6: return "Task A - Last Flight (5:00 Max, 7 Min)";
-    case  7: return "Task B - Last Two Flights (4:00 Max)";
-    case  8: return "Task C - All Up Last Down x3";
-    case  9: return "Task D - Ladder (7 rungs: 0:30-2:00)";
-    case 10: return "Task E - Poker (5 targets, 10 Min)";
-    case 11: return "Task F - Three of Six (3:00 Max)";
-    case 12: return "Task G - Five Longest (2:00 Max)";
-    case 13: return "Task H - 1,2,3,4 Minute";
-    case 14: return "Task I - Three Longest (3:20 Max)";
-    case 15: return "Task J - Last Three (3:00 Max)";
-    case 17: return "Task C - All Up Last Down x4";
-    case 18: return "Task C - All Up Last Down x5";
-    case 19: return "Task A - Last Flight (5:00 Max, 10 Min)";
-    case 20: return "Task B - Last Two Flights (3:00 Max, 7 Min)";
-    case 21: return "Task K - Big Ladder";
-    case 26: return "Task D (2020) - Two Flights (5:00 Max)";
-    case 27: return "Task E (2020) - Poker 3 Flights, 10 Min";
-    case 28: return "Task E (2020) - Poker 3 Flights, 15 Min";
-    case 29: return "Task L - Single Flight (9:59 Max)";
-    case 30: return "Task M - Huge Ladder (3, 5, 7 Min)";
-    case 33: return "Task N - Best Flight (9:59 Max)";
-    case 34: return "Task L - Single Flight (6:59 Max)";
-    default: return "Low Launch (custom)";
-  }
-}
-
 // ── Hardware timers — window timing ──────────────────────────
 // Two independent ESP32 hardware timers replace millis()-based polling
 // for the two most timing-critical moments: window open and window close.
@@ -192,8 +142,6 @@ const char* taskName(uint8_t tid) {
 static hw_timer_t* _timer_open  = nullptr;
 static hw_timer_t* _timer_close = nullptr;
 
-volatile bool          window_open_pending  = false;
-volatile bool          window_close_pending = false;
 volatile unsigned long window_open_latch_ms  = 0;  // millis() at ISR fire
 volatile unsigned long window_close_latch_ms = 0;  // millis() at ISR fire
 
@@ -230,478 +178,34 @@ void disarmWindowCloseTimer() { if (_timer_close) timerStop(_timer_close); }
 // Scorer sends 0x21 during prep time so units can auto-open the
 
 
+
 // ============================================================
-//  LittleFS — load full config
+//  snapDiagnostics — 1 Hz, always runs regardless of web state
+//  Populates diag struct for Packet 4. Serial output is silent
+//  after calibration — only events are printed.
 // ============================================================
-void loadConfig() {
-  if (!LittleFS.begin(true)) {
-    logts(); Serial.println("LittleFS: mount failed — using defaults.");
-    return;
+void snapDiagnostics() {
+  diag.rssi_dbm     = WiFi.RSSI();
+  diag.free_heap    = ESP.getFreeHeap();
+  diag.loop_max_us  = loop_max_us;
+  diag.sample_count = buf_count;
+
+  if (loop_count > 0) {
+    diag.loop_avg_us  = (float)loop_us_total / loop_count;
+    diag.cpu_load_pct = loop_us_total > 0
+                        ? 100.0f * (float)busy_us_total / (float)loop_us_total
+                        : 0.0f;
   }
-  logts(); Serial.println("LittleFS: mounted OK");
+  loop_count = busy_us_total = loop_us_total = loop_max_us = 0;
 
-  if (!LittleFS.exists(CONFIG_PATH)) {
-    logts(); Serial.println("LittleFS: config not found — using defaults.");
-    LittleFS.end(); return;
-  }
+  // When web is disabled, flushDisplayBatch() never runs so buf_count
+  // never resets. Reset it here so the display buffer doesn't saturate.
+  if (!cfg.web_enabled) buf_count = 0;
 
-  File f = LittleFS.open(CONFIG_PATH, "r");
-  if (!f) { Serial.println("LittleFS: open failed."); LittleFS.end(); return; }
-  String s = f.readString();
-  f.close();
-  LittleFS.end();
-
-  // Simple key:value parser — no external JSON library needed
-  auto parseInt = [&](const char* key, int fallback) -> int {
-    int idx = s.indexOf(key);
-    if (idx < 0) return fallback;
-    int colon = s.indexOf(':', idx);
-    if (colon < 0) return fallback;
-    int v = s.substring(colon + 1).toInt();
-    return v;
-  };
-
-  int id  = parseInt("\"unit_id\"",      DEFAULT_UNIT_ID);
-  int web = parseInt("\"web_enabled\"",   1);
-  int cpu = parseInt("\"cpu_mhz\"",      240);
-  int wn  = parseInt("\"window_number\"", 0);
-
-  cfg.unit_id       = (id >= 1 && id <= 200) ? (uint8_t)id : DEFAULT_UNIT_ID;
-  cfg.web_enabled   = (web == 1);
-  cfg.cpu_mhz       = (cpu == 80 || cpu == 160 || cpu == 240) ? cpu : 240;
-  cfg.window_number = (wn >= 0 && wn <= 9999) ? (uint16_t)wn : 0;
-
-  logts(); Serial.printf("Config loaded: unit_id=%d  web=%s  cpu=%dMHz  window=%d\n",
-                cfg.unit_id,
-                cfg.web_enabled ? "ON" : "OFF",
-                cfg.cpu_mhz,
-                cfg.window_number);
+  // Silent after calibration — no periodic output, events only
 }
 
 
-// ============================================================
-//  UDP packet — 14 bytes, big-endian
-//  Byte 0:    unit_id
-//  Byte 1:    state
-//  Bytes 2-3: altitude × 10  (uint16)
-//  Bytes 4-7: timestamp_ms   (uint32)
-//  Bytes 8-9: duration × 10  (uint16)
-//  Byte 10:   peak_alt_ft    (uint8)
-//  Bytes 11-12: launch_ht×10 (uint16)
-//  Byte 13:   battery_pct    (uint8)
-// ============================================================
-void sendUdpPacket() {
-  uint8_t pkt[14] = {0};
-
-  uint16_t alt10      = (uint16_t)constrain(flight.altitude_ft    * 10.0f, 0, 65535);
-  uint16_t dur10      = (uint16_t)constrain(flight.flight_duration_ms / 100, 0, 65535);
-  uint8_t  peak       = (uint8_t) constrain(flight.peak_alt_ft,   0, 255);
-  uint16_t launch10   = (uint16_t)constrain(flight.launch_height_ft * 10.0f, 0, 65535);
-  uint32_t ts         = millis();
-
-  pkt[0]  = flight.unit_id;
-  pkt[1]  = (uint8_t)flight.state;
-
-  // Big-endian multi-byte fields
-  pkt[2]  = (alt10    >> 8) & 0xFF;
-  pkt[3]  =  alt10          & 0xFF;
-
-  pkt[4]  = (ts       >> 24) & 0xFF;
-  pkt[5]  = (ts       >> 16) & 0xFF;
-  pkt[6]  = (ts       >>  8) & 0xFF;
-  pkt[7]  =  ts              & 0xFF;
-
-  pkt[8]  = (dur10    >> 8) & 0xFF;
-  pkt[9]  =  dur10          & 0xFF;
-
-  pkt[10] = peak;
-
-  pkt[11] = (launch10 >> 8) & 0xFF;
-  pkt[12] =  launch10       & 0xFF;
-
-  pkt[13] = flight.battery_pct;
-
-  udp.beginPacket(SERVER_IP, UDP_PORT);
-  udp.write(pkt, 14);
-  udp.endPacket();
-}
-
-// ============================================================
-//  UDP Packet 4 — Debug/Health (Port 4213)
-//  14 bytes, big-endian, 5 Hz
-//
-//  Byte 0:    unit_id
-//  Byte 1:    rssi_dbm      (int8,   signed)
-//  Byte 2:    cpu_load_pct  (uint8,  0-100)
-//  Bytes 3-4: free_heap_kb  (uint16, ÷10 → kB)
-//  Bytes 5-6: loop_avg_us   (uint16, µs)
-//  Bytes 7-8: loop_max_us   (uint16, µs)
-//  Bytes 9-10: temperature  (int16,  ÷100 → °C)
-//  Byte 11:   state         (uint8,  mirrors Packet 1)
-//  Bytes 12-13: spare       (0x00)
-// ============================================================
-void sendDebugPacket() {
-  uint8_t pkt[14] = {0};
-
-  // Clamp diagnostics to fit field widths
-  int8_t   rssi    = (int8_t)constrain(diag.rssi_dbm, -128, 127);
-  uint8_t  cpu     = (uint8_t)constrain((int)diag.cpu_load_pct, 0, 100);
-  uint16_t heap10  = (uint16_t)constrain((diag.free_heap / 100), 0, 65535);
-  uint16_t lavg    = (uint16_t)constrain((int)diag.loop_avg_us, 0, 65535);
-  uint16_t lmax    = (uint16_t)constrain((int)diag.loop_max_us, 0, 65535);
-  int16_t  temp100 = (int16_t)constrain((int)(live_temperature_c * 100.0f), -32768, 32767);
-
-  pkt[0]  = flight.unit_id;
-  pkt[1]  = (uint8_t)rssi;           // cast preserves sign bits
-  pkt[2]  = cpu;
-  pkt[3]  = (heap10  >> 8) & 0xFF;
-  pkt[4]  =  heap10        & 0xFF;
-  pkt[5]  = (lavg    >> 8) & 0xFF;
-  pkt[6]  =  lavg          & 0xFF;
-  pkt[7]  = (lmax    >> 8) & 0xFF;
-  pkt[8]  =  lmax          & 0xFF;
-  pkt[9]  = (temp100 >> 8) & 0xFF;
-  pkt[10] =  temp100       & 0xFF;
-  pkt[11] = (uint8_t)flight.state;
-  pkt[12] = 0x00;                    // spare
-  pkt[13] = 0x00;                    // spare
-
-  udp.beginPacket(SERVER_IP, UDP_DBG_PORT);
-  udp.write(pkt, 14);
-  udp.endPacket();
-}
-
-// ============================================================
-//  UDP Packet 2 — GPS Fix (Port 4211)
-//  16 bytes, big-endian, transmitted only when fix_quality > 0
-//  Per ICD v1.5 Section 3
-//
-//  Byte 0:    unit_id        (uint8)
-//  Byte 1:    fix_quality    (uint8)   0=none 1=GPS 2=DGPS 6=est
-//  Byte 2:    satellites     (uint8)   0–32
-//  Byte 3:    hdop_x10       (uint8)   HDOP × 10, capped 255
-//  Bytes 4–7: latitude_e5   (int32)   decimal degrees × 100000
-//  Bytes 8–11:longitude_e5  (int32)   decimal degrees × 100000
-//  Bytes 12–13:altitude_m_x10 (int16) MSL decimetres, signed
-//  Bytes 14–15:spare         (0x00)
-// ============================================================
-void sendGpsPacket() {
-  if (!gps_fix) return;   // ICD: only transmit when fix_quality > 0
-
-  uint8_t pkt[16] = {0};
-
-  int32_t lat_e5 = (int32_t)(gps_lat * 100000.0f);
-  int32_t lon_e5 = (int32_t)(gps_lon * 100000.0f);
-  int16_t alt_dm = (int16_t)constrain(gps_alt_m * 10.0f, -32768.0f, 32767.0f);
-  uint8_t hdop10 = (uint8_t)constrain(gps_hdop  * 10.0f, 0.0f, 255.0f);
-
-  pkt[0]  = cfg.unit_id;
-  pkt[1]  = gps_fix_quality;
-  pkt[2]  = gps_sats;
-  pkt[3]  = hdop10;
-
-  pkt[4]  = (lat_e5 >> 24) & 0xFF;
-  pkt[5]  = (lat_e5 >> 16) & 0xFF;
-  pkt[6]  = (lat_e5 >>  8) & 0xFF;
-  pkt[7]  =  lat_e5        & 0xFF;
-
-  pkt[8]  = (lon_e5 >> 24) & 0xFF;
-  pkt[9]  = (lon_e5 >> 16) & 0xFF;
-  pkt[10] = (lon_e5 >>  8) & 0xFF;
-  pkt[11] =  lon_e5        & 0xFF;
-
-  pkt[12] = (alt_dm >> 8) & 0xFF;
-  pkt[13] =  alt_dm       & 0xFF;
-  pkt[14] = 0x00;
-  pkt[15] = 0x00;
-
-  udp_gps.beginPacket(SERVER_IP, 4211);
-  udp_gps.write(pkt, 16);
-  udp_gps.endPacket();
-}
-
-// ============================================================
-//  saveConfig — persists window_number back to LittleFS
-// ============================================================
-void saveConfig() {
-  if (!LittleFS.begin(false)) return;
-  File f = LittleFS.open(CONFIG_PATH, "w");
-  if (!f) {
-    if (littlefs_streaming <= 0 && !log_open) LittleFS.end();
-    return;
-  }
-  f.printf("{\n  \"unit_id\": %d,\n  \"web_enabled\": %d,\n"
-           "  \"cpu_mhz\": %d,\n  \"window_number\": %d\n}\n",
-           cfg.unit_id, cfg.web_enabled ? 1 : 0,
-           cfg.cpu_mhz, cfg.window_number);
-  f.close();
-  if (littlefs_streaming <= 0 && !log_open) LittleFS.end();
-  logts(); Serial.printf("[CFG] Saved window_number=%d\n", cfg.window_number);
-}
-
-
-// ============================================================
-//  calculateScore — unified scoring with selectable formula
-//
-//  Mode 0 — Secs-Ft:
-//    duration_s - throw_height_ft  (window-independent, no normalization)
-//    Window score = sum of all flight scores
-//
-//  Mode 1 — JoeD V1:
-//    time_score = (duration_s / 180)^0.425 * 1000   ← t_max ALWAYS 180s
-//    h <= 100ft: score = time_score + (100-h)^1.6 * 0.113  (cap 1100)
-//    h >  100ft: score = time_score - (h-100)^2.3 * 0.09   (floor 0)
-//    Window score = AVERAGE of all flight scores (including airborne-at-close)
-// ============================================================
-float calculateScore(float dur_s, float throw_height_ft) {
-  if (score_mode == 1) {
-    // JoeD V1 — t_max is always 3 minutes (180s), independent of window length
-    const float JOED_TMAX = 180.0f;
-    float time_ratio = constrain(dur_s / JOED_TMAX, 0.0f, 1.0f);
-    float score_t    = powf(time_ratio, 0.425f) * 1000.0f;
-    float h          = throw_height_ft;
-    float final_score;
-    if (h <= 100.0f) {
-      float bonus = powf(100.0f - h, 1.6f) * 0.113f;
-      final_score = score_t + bonus;
-    } else {
-      float penalty = powf(h - 100.0f, 2.3f) * 0.09f;
-      final_score = score_t - penalty;
-    }
-    return constrain(final_score, 0.0f, 1100.0f);
-  }
-
-  // Mode 0 — Secs-Ft: duration_s - throw_height_ft (window-independent)
-  if (window_secs == 0) return 0.0f;
-  return dur_s - throw_height_ft;
-}
-
-// ============================================================
-//  UDP Packet 5 — Log Announcement (Port 4214)
-//  14 bytes, big-endian
-//
-//  Byte 0:     unit_id
-//  Byte 1:     packet_type  0x10
-//  Bytes 2-3:  window_number  (uint16)
-//  Bytes 4-7:  window_id      (uint32)
-//  Bytes 8-11: file_size      (uint32, bytes)
-//  Bytes 12-13: spare
-// ============================================================
-void sendAnnouncement() {
-  // Use the file size cached at window close — avoids concurrent LittleFS
-  // access while AsyncWebServer may be serving other files, which can panic.
-  uint32_t file_size = announce_file_size;
-
-  uint8_t pkt[14] = {0};
-  pkt[0]  = flight.unit_id;
-  pkt[1]  = 0x10;  // log available
-  pkt[2]  = (cfg.window_number >> 8) & 0xFF;
-  pkt[3]  =  cfg.window_number       & 0xFF;
-  pkt[4]  = (window_id >> 24) & 0xFF;
-  pkt[5]  = (window_id >> 16) & 0xFF;
-  pkt[6]  = (window_id >>  8) & 0xFF;
-  pkt[7]  =  window_id        & 0xFF;
-  pkt[8]  = (file_size >> 24) & 0xFF;
-  pkt[9]  = (file_size >> 16) & 0xFF;
-  pkt[10] = (file_size >>  8) & 0xFF;
-  pkt[11] =  file_size        & 0xFF;
-  pkt[12] = 0x00;
-  pkt[13] = 0x00;
-
-  udp.beginPacket(SERVER_IP, UDP_ANN_PORT);
-  udp.write(pkt, 14);
-  udp.endPacket();
-  logts(); Serial.printf("[LOG] Announce window_%03d  %u bytes  (%d/%d)\n",
-                cfg.window_number, file_size, announce_count + 1, ANNOUNCE_REPEATS);
-}
-
-// ============================================================
-//  checkWindowCommand — poll udp_win for scorer broadcasts (ICD v1.7)
-//
-//  Packet 0x20 — Window Start (14 bytes, big-endian):
-//    Byte 0:     0x20
-//    Byte 1:     0xFF (broadcast marker)
-//    Bytes 2-3:  window_secs  uint16
-//    Bytes 4-7:  window_id    uint32
-//    Byte 8:     task_id      uint8   (F3XVault flight_type_id; 0=unknown)  NEW v1.7
-//    Byte 9:     round_num    uint8   (1-based; 0=unknown)                  NEW v1.7
-//    Byte 10:    group_num    uint8   (1-based; 0=unknown)                  NEW v1.7
-//    Bytes 11-13: spare
-//
-//  Packet 0x21 — Prep Countdown (14 bytes, big-endian):
-//    Byte 0:     0x21
-//    Byte 1:     0xFF (broadcast marker)
-//    Bytes 2-3:  countdown_secs  uint16  — seconds until window opens
-//    Bytes 4-5:  window_secs     uint16  — window duration when it fires
-//    Bytes 6-9:  window_id       uint32  — will match the 0x20 that follows
-//    Byte 10:    task_id         uint8   NEW v1.7
-//    Byte 11:    round_num       uint8   NEW v1.7
-//    Byte 12:    group_num       uint8   NEW v1.7
-//    Byte 13:    spare
-//  Packet 0x22 — TOD Sync (6 bytes, big-endian):
-//    Byte 0:     0x22
-//    Byte 1:     0xFF (broadcast marker)
-//    Bytes 2-5:  scorer_ms_since_midnight  (uint32, UTC milliseconds since 00:00:00)
-//    Sent every 5s during prep and window. Unit compares vs GPS UTC and prints delta.
-//    Warnings printed at >2s delta, ERROR at >20s delta.
-// ============================================================
-void checkWindowCommand(unsigned long now) {
-  int pkt_size = udp_win.parsePacket();
-  if (pkt_size < 14) return;
-
-  uint8_t buf[14] = {0};
-  udp_win.read(buf, 14);
-
-  uint8_t ptype = buf[0];
-
-  // Drain buffer before any early return
-  while (udp_win.parsePacket() > 0) udp_win.flush();
-
-  // ── 0x22 — TOD sync ──────────────────────────────────────────
-  if (ptype == 0x22) {
-    uint32_t scorer_ms = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16)
-                       | ((uint32_t)buf[4] <<  8) |  buf[5];
-
-    if (gps_fix) {
-      // Compute GPS ms since midnight UTC
-      uint32_t gps_ms = ((uint32_t)gps_hour   * 3600000UL)
-                      + ((uint32_t)gps_minute  *   60000UL)
-                      + ((uint32_t)gps_second *    1000UL)
-                      + ((uint32_t)gps_milliseconds);
-      int32_t  delta_ms = (int32_t)scorer_ms - (int32_t)gps_ms;
-
-      // Format both as HH:MM:SS.mmm
-      auto fmtTOD = [](uint32_t ms) -> String {
-        uint32_t h   = ms / 3600000;  ms %= 3600000;
-        uint32_t m   = ms /   60000;  ms %=   60000;
-        uint32_t s   = ms /    1000;  ms %=    1000;
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%03u", h, m, s, ms);
-        return String(buf);
-      };
-
-      const char* status = "OK";
-      if      (abs(delta_ms) > 20000) status = "ERROR — BROKEN SYNC";
-      else if (abs(delta_ms) >  2000) status = "WARNING — drift > 2s";
-
-      logts(); Serial.printf("[TOD] Scorer: %s  GPS: %s  delta=%+dms  %s\n",
-                    fmtTOD(scorer_ms).c_str(), fmtTOD(gps_ms).c_str(),
-                    delta_ms, status);
-    } else {
-      // No GPS fix — print scorer time only
-      uint32_t ms = scorer_ms;
-      uint32_t h  = ms / 3600000; ms %= 3600000;
-      uint32_t m  = ms /   60000; ms %=   60000;
-      uint32_t s  = ms /    1000; ms %=    1000;
-      logts(); Serial.printf("[TOD] Scorer: %02u:%02u:%02u.%03u  (no GPS fix)\n", h, m, s, ms);
-    }
-    return;
-  }
-
-  // ── 0x21 — Prep countdown ────────────────────────────────────
-  if (ptype == 0x21) {
-    // Rule 6: ignore if window already active
-    if (window_active) {
-      logts(); Serial.println("[WIN] 0x21 ignored — window already active");
-      return;
-    }
-
-    uint16_t countdown_secs = ((uint16_t)buf[2] << 8) | buf[3];
-    uint16_t win_secs       = ((uint16_t)buf[4] << 8) | buf[5];
-    uint32_t wid            = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16)
-                            | ((uint32_t)buf[8] <<  8) |  buf[9];
-    // v1.7: task context bytes [10–12]
-    contest_task_id   = buf[10];
-    contest_round_num = buf[11];
-    contest_group_num = buf[12];
-
-    logts(); Serial.printf("[WIN] 0x21 prep: countdown=%ds  win=%ds  id=%u  task=%u  R%u G%u\n",
-                  countdown_secs, win_secs, wid, contest_task_id, contest_round_num, contest_group_num);
-
-    if (prep_active && prep_window_id != wid) {
-      // Rule 3: different window_id — discard old countdown, start fresh
-      logts(); Serial.printf("[WIN] 0x21 new id=%u (was %u) — resetting countdown\n", wid, prep_window_id);
-      prep_active = false;
-      // Discard any pre-opened log for the old window
-      if (log_preopen_done && log_open && !window_active) {
-        log_file.close();
-        LittleFS.end();
-        log_open         = false;
-        log_preopen_done = false;
-        logts(); Serial.println("[LOG] Pre-opened log discarded (prep reset)");
-      }
-    }
-
-    if (!prep_active) {
-      // Rule 1: no countdown running — start from countdown_secs
-      prep_fire_ms     = now + (uint32_t)countdown_secs * 1000UL;
-      prep_window_secs = win_secs;
-      prep_window_id   = wid;
-      prep_active      = true;
-      armWindowOpenTimer((uint32_t)countdown_secs * 1000UL);
-      logts(); Serial.printf("[WIN] 0x21 countdown started: fires in %ds  win=%ds  id=%u\n",
-                    countdown_secs, win_secs, wid);
-    } else {
-      // Rule 2: countdown already running for same window_id — adjust remaining time
-      unsigned long new_fire = now + (uint32_t)countdown_secs * 1000UL;
-      long drift = (long)new_fire - (long)prep_fire_ms;
-      prep_fire_ms     = new_fire;
-      prep_window_secs = win_secs;
-      armWindowOpenTimer((uint32_t)countdown_secs * 1000UL);  // re-arm with corrected value
-      logts(); Serial.printf("[WIN] 0x21 countdown adjusted: drift=%ldms  fires in %ds\n",
-                    drift, countdown_secs);
-    }
-    return;
-  }
-
-  // ── 0x20 — Window start ──────────────────────────────────────
-  if (ptype != 0x20) return;  // unknown type
-
-  uint16_t secs = ((uint16_t)buf[2] << 8) | buf[3];
-  uint32_t wid  = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
-                | ((uint32_t)buf[6] <<  8) |  buf[7];
-  // v1.7: task context bytes [8–10]
-  contest_task_id   = buf[8];
-  contest_round_num = buf[9];
-  contest_group_num = buf[10];
-
-  logts(); Serial.printf("[WIN] 0x20 start: secs=%d  id=%u  task=%u  R%u G%u\n",
-                secs, wid, contest_task_id, contest_round_num, contest_group_num);
-
-  // Rule 5: 0x20 while prep countdown running → cancel countdown, open immediately
-  if (prep_active) {
-    logts(); Serial.println("[WIN] 0x20 cancels prep countdown — opening immediately");
-    prep_active = false;
-  }
-
-  if (window_active) {
-    // Grace period: if the current window just opened within the last
-    // WINDOW_OPEN_GRACE_MS, treat this 0x20 as the authoritative confirmation
-    // rather than a new window. This absorbs the race where the prep countdown
-    // fires ~500ms before the scorer's 0x20 arrives, which would otherwise
-    // produce a tiny orphan log followed by a duplicate window open.
-    // In this case: update window_id and window_secs in place, no close/reopen.
-    const uint32_t WINDOW_OPEN_GRACE_MS = 3000;
-    if ((now - window_start_ms) < WINDOW_OPEN_GRACE_MS) {
-      logts(); Serial.printf("[WIN] 0x20 within grace period (%lums after open) — adopting id=%u secs=%d  task=%u R%u G%u\n",
-                    now - window_start_ms, wid, secs, contest_task_id, contest_round_num, contest_group_num);
-      window_id   = wid;
-      window_secs = secs;
-      // contest_task_id / round / group already set above from buf[8–10]
-      // Don't adjust window_start_ms — keep the time the window actually opened
-      return;
-    }
-    logts(); Serial.println("[WIN] 0x20 while window active — closing current");
-    closeWindowLog();
-  }
-
-  window_secs     = secs;
-  window_id       = wid;
-  window_start_ms = now;
-  window_active   = true;
-  logts(); Serial.printf("[WIN] Window open  id=%u  duration=%ds\n", wid, secs);
-  openWindowLog();
-}
 // ============================================================
 void updateStateMachine(float alt_ft) {
   // ── Thresholds — tuned from 3-session real flight data ───────
@@ -1062,31 +566,6 @@ void updateStateMachine(float alt_ft) {
   }
 }
 
-// ============================================================
-//  snapDiagnostics — 1 Hz, always runs regardless of web state
-//  Populates diag struct for Packet 4. Serial output is silent
-//  after calibration — only events are printed.
-// ============================================================
-void snapDiagnostics() {
-  diag.rssi_dbm     = WiFi.RSSI();
-  diag.free_heap    = ESP.getFreeHeap();
-  diag.loop_max_us  = loop_max_us;
-  diag.sample_count = buf_count;
-
-  if (loop_count > 0) {
-    diag.loop_avg_us  = (float)loop_us_total / loop_count;
-    diag.cpu_load_pct = loop_us_total > 0
-                        ? 100.0f * (float)busy_us_total / (float)loop_us_total
-                        : 0.0f;
-  }
-  loop_count = busy_us_total = loop_us_total = loop_max_us = 0;
-
-  // When web is disabled, flushDisplayBatch() never runs so buf_count
-  // never resets. Reset it here so the display buffer doesn't saturate.
-  if (!cfg.web_enabled) buf_count = 0;
-
-  // Silent after calibration — no periodic output, events only
-}
 
 // ============================================================
 //  5 Hz web display batch flush (staggered 100ms from scorer packet)

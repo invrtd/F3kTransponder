@@ -63,6 +63,15 @@ extern unsigned long prep_fire_ms;
 extern uint16_t      prep_window_secs;
 extern uint32_t      prep_window_id;
 
+// ── Window runtime state ─────────────────────────────────────
+extern bool          window_active;
+extern uint16_t      window_secs;
+extern uint32_t      window_id;
+extern unsigned long window_start_ms;
+extern unsigned long window_close_ms;
+extern volatile bool window_open_pending;
+extern volatile bool window_close_pending;
+
 // ── Deferred WiFi shutdown ───────────────────────────────────
 extern bool          wifi_shutdown_pending;
 extern unsigned long wifi_shutdown_after_ms;
@@ -75,6 +84,10 @@ extern volatile int  littlefs_streaming;
 extern char          log_path[32];
 extern uint16_t      flight_counter;
 extern File          log_file;
+
+// ── Logging / pruning flags ──────────────────────────────────
+extern bool prune_pending;
+extern bool log_preopen_done;
 
 // ── Announce timer — Packet 5 after window closes ────────────
 extern bool          announce_pending;
@@ -124,8 +137,8 @@ extern WiFiUDP udp_win;
 extern WiFiUDP udp_gps;
 
 // ── Flight records ───────────────────────────────────────────
-extern const int MAX_FLIGHT_RECORDS;
-extern FlightRecord flight_records[];
+constexpr int MAX_FLIGHT_RECORDS = 10;
+extern FlightRecord flight_records[MAX_FLIGHT_RECORDS];
 extern int flight_record_count;
 
 // ── Calibration state ────────────────────────────────────────
@@ -148,6 +161,17 @@ extern uint8_t       score_mode;
 extern bool          ap_mode;
 extern bool          wifi_active;
 extern FlightState   prev_flight_state;
+
+// ── Contest context (ICD v1.7) ────────────────────────────────
+// Received from scorer in 0x20 bytes [8–10] and 0x21 bytes [10–12].
+// Written into CSV comment headers for human-readable context.
+extern uint8_t  contest_task_id;   // F3XVault flight_type_id; 0 = unknown/LL
+extern uint8_t  contest_round_num; // 1-based; 0 = unknown
+extern uint8_t  contest_group_num; // 1-based; 0 = unknown
+
+// Task name lookup table keyed by task_id (F3XVault flight_type_id)
+// Returns human-readable string for CSV headers.
+const char* taskName(uint8_t tid);
 
 // ── Pilot AP countdown state ─────────────────────────────────
 extern bool          window_countdown_active;

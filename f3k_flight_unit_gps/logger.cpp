@@ -1,3 +1,4 @@
+#include "logger.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <LittleFS.h>
@@ -8,6 +9,23 @@
 #include "globals.h"
 #include "sensors.h"
 #include "secrets.h"
+
+#ifndef LITTLEFS_FULL_PCT
+#define LITTLEFS_FULL_PCT 60
+#endif
+// Symbols still owned outside logger.cpp during this staged extraction.
+extern void logts();
+extern float calculateScore(float dur_s, float throw_height_ft);
+extern void sendAnnouncement();
+
+extern void armWindowCloseTimer(uint32_t delay_ms);
+extern void disarmWindowOpenTimer();
+extern void disarmWindowCloseTimer();
+
+#ifndef MAX_SUMMARIES
+#define MAX_SUMMARIES  16   // keep at most 16 summary files (≈ 2-day contest)
+#endif
+
 // ============================================================
 //  pruneLogsIfNeeded — called from main loop during idle ground state
 //  Deletes AT MOST ONE FILE per call, then sets prune_pending=true if
@@ -20,8 +38,6 @@
 //  1. Summary cap: delete oldest summary (+ matching window log) if >16
 //  2. Space threshold: delete oldest window log if usage > LITTLEFS_FULL_PCT
 // ============================================================
-#define MAX_SUMMARIES  16   // keep at most 16 summary files (≈ 2-day contest)
-
 void pruneLogsIfNeeded() {
   if (!LittleFS.begin(false)) return;
 
@@ -413,15 +429,16 @@ void closeWindowLog() {
       flight_record_count < MAX_FLIGHT_RECORDS) {
     float dur = flight.flight_duration_ms / 1000.0f;
     float score = calculateScore(dur, flight.throw_height_ft);
-    flight_records[flight_record_count++] = {
-      (uint16_t)flight_counter,
-      dur,
-      flight.throw_height_ft,
-      flight.peak_alt_ft,
-      score,
-      (unsigned long)max(0L, (long)(flight_start_epoch_ms - log_epoch_ms)),
-      window_close_ms - log_epoch_ms
-    };
+    FlightRecord rec;
+    rec.flight_num      = (uint16_t)flight_counter;
+    rec.duration_s      = dur;
+    rec.throw_height_ft = flight.throw_height_ft;
+    rec.peak_alt_ft     = flight.peak_alt_ft;
+    rec.score           = score;
+    rec.start_time_ms   = (unsigned long)max(0L, (long)(flight_start_epoch_ms - log_epoch_ms));
+    rec.end_time_ms     = window_close_ms - log_epoch_ms;
+
+    flight_records[flight_record_count++] = rec;
     logts(); Serial.printf("[SCORE] Window close — flight #%d still airborne: dur=%.1fs score=%.1f\n",
                   flight_counter, dur, score);
   }

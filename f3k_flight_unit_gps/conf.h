@@ -42,6 +42,7 @@
 #define CONFIG_PATH     "/f3k_config.json"
 #define DEFAULT_UNIT_ID 1
 #define LOG_DIR         "/logs"
+#define LITTLEFS_FULL_PCT 60         // auto-delete threshold — prune early to avoid pressure
 
 
 // ── Launch detection thresholds ──────────────────────────────
