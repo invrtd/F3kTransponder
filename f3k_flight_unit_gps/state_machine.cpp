@@ -1,15 +1,15 @@
-#include "state_machine.h"
+#include "include/state_machine.h"
 
 #include <Arduino.h>
 #include <math.h>
 
 #include "conf.h"
 #include "types.h"
-#include "globals.h"
-#include "sensors.h"
-#include "logger.h"
-#include "scoring.h"
-#include "runtime.h"
+#include "include/globals.h"
+#include "include/sensors.h"
+#include "include/logger.h"
+#include "include/scoring.h"
+#include "include/runtime.h"
 
 // ============================================================
 void updateStateMachine(float alt_ft) {

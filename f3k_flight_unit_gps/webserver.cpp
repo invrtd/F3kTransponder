@@ -1,8 +1,8 @@
-#include "webserver.h"
+#include "include/webserver.h"
 #include "conf.h"
 #include "types.h"
-#include "globals.h"
-#include "sensors.h"
+#include "include/globals.h"
+#include "include/sensors.h"
 
 #include <Arduino.h>
 #include <WiFi.h>

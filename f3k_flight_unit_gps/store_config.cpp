@@ -1,10 +1,10 @@
-#include "store_config.h"
+#include "include/store_config.h"
 
 #include <Arduino.h>
 #include <LittleFS.h>
 
 #include "conf.h"
-#include "globals.h"
+#include "include/globals.h"
 
 extern void logts();
 

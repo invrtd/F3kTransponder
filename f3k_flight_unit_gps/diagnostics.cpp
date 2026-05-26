@@ -1,7 +1,7 @@
-#include "diagnostics.h"
+#include "include/diagnostics.h"
 
 #include <WiFi.h>
-#include "globals.h"
+#include "include/globals.h"
 // ============================================================
 //  snapDiagnostics — 1 Hz, always runs regardless of web state
 //  Populates diag struct for Packet 4. Serial output is silent

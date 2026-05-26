@@ -1,7 +1,7 @@
-#include "window.h"
+#include "include/window.h"
 
-#include "globals.h"
-#include "runtime.h"
+#include "include/globals.h"
+#include "include/runtime.h"
 
 // ── Hardware timers — window timing ──────────────────────────
 // Two independent ESP32 hardware timers replace millis()-based polling

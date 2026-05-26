@@ -1,7 +1,7 @@
-#include "scoring.h"
+#include "include/scoring.h"
 
 #include <Arduino.h>
-#include "globals.h"
+#include "include/globals.h"
 
 // ============================================================
 //  calculateScore — unified scoring with selectable formula

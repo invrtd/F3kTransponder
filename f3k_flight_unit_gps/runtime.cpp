@@ -1,6 +1,6 @@
-#include "runtime.h"
+#include "include/runtime.h"
 
-#include "sensors.h"
+#include "include/sensors.h"
 
 // ── Log timestamp helper ──────────────────────────────────────
 // Prints a timestamp prefix before every Serial log line.

@@ -1,4 +1,4 @@
-#include "globals.h"
+#include "include/globals.h"
 
 Config cfg = { DEFAULT_UNIT_ID, true, 240, 0 };
 

@@ -1,3 +1,6 @@
+#ifndef F3K_CONF_H
+#define F3K_CONF_H
+
 #pragma once
 #include <Arduino.h>
 // ── Debug / bench test mode ──────────────────────────────────
@@ -73,5 +76,6 @@
 
 
 // ── Window countdown ─────────────────────────────────────────
-const uint32_t WINDOW_COUNTDOWN_MS = 5000;
+static constexpr uint32_t WINDOW_COUNTDOWN_MS = 5000;
 
+#endif // F3K_CONF_H

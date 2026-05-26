@@ -1,11 +1,11 @@
-#include "flight_sim.h"
+#include "include/flight_sim.h"
 
 #include <Arduino.h>
 
-#include "../../conf.h"
-#include "globals.h"
-#include "sensors.h"
-#include "runtime.h"
+#include "conf.h"
+#include "include/globals.h"
+#include "include/sensors.h"
+#include "include/runtime.h"
 
 // ── Static state ────────────────────────────────────────────
 static unsigned long sim_phase_ms    = 0;

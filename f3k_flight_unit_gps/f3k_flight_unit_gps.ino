@@ -113,7 +113,7 @@
 #include "include/diagnostics.h"
 #include "include/state_machine.h"
 #include "include/display_batch.h"
-#include "flight_sim.h" // debug tilt mode flight simulation
+#include "include/flight_sim.h" // debug tilt mode flight simulation
 
 // ============================================================
 //  setup()

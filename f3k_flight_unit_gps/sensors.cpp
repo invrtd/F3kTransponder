@@ -1,5 +1,5 @@
-#include "sensors.h"
-#include "globals.h"
+#include "include/sensors.h"
+#include "include/globals.h"
 
 #include <Wire.h>
 #include <Adafruit_DPS310.h>

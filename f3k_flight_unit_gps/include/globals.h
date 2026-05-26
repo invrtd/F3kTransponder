@@ -6,8 +6,8 @@
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
 
-#include "conf.h"
-#include "types.h"
+#include "../conf.h"
+#include "../types.h"
 
 // ============================================================
 // globals.h

@@ -1,8 +1,8 @@
-#include "display_batch.h"
+#include "include/display_batch.h"
 
-#include "globals.h"
-#include "sensors.h"
-#include "runtime.h"
+#include "include/globals.h"
+#include "include/sensors.h"
+#include "include/runtime.h"
 
 // ============================================================
 void flushDisplayBatch() {
