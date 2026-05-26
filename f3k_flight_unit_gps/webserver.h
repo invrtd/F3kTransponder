@@ -1,9 +1,6 @@
 #pragma once
+
 #include <Arduino.h>
-#include <ESPAsyncWebServer.h>
-#include "conf.h"
-#include "types.h"
-#include "html.h"
 
+// Registers all AsyncWebServer routes and starts the server.
 void setupWebServer();
-

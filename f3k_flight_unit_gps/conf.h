@@ -41,6 +41,8 @@
 // ── LittleFS config ──────────────────────────────────────────
 #define CONFIG_PATH     "/f3k_config.json"
 #define DEFAULT_UNIT_ID 1
+#define LOG_DIR         "/logs"
+
 
 // ── Launch detection thresholds ──────────────────────────────
 #define LAUNCH_G_THRESHOLD    3.5f    // acceleration spike (primary trigger)
@@ -51,7 +53,7 @@
 #define LAND_IMPACT_G         4.0f    // impact G-spike threshold
 
 // ── Calibration & tilt ───────────────────────────────────────
-#define CAL_BUF_SIZE          50      // max samples (8 Hz × 5s ≈ 40)
+#define CAL_BUF_SIZE          50      //  calibration sample buffer max samples (8 Hz × 5s ≈ 40)
 #define CAL_WINDOW_MS         5000    // 5 second calibration window
 #define CALIBRATION_MS        5000    // duration of baseline averaging
 #define TILT_CAL_STABLE_THRESHOLD  0.1f  // G variance below this = stable
@@ -61,12 +63,14 @@
 
 // ── Data buffer & logging ────────────────────────────────────
 #define BUF_SIZE              10      // 1 Hz display batch (sensor ringbuffer)
-#define CAL_BUF_SIZE          50      // calibration sample buffer
-
 // ── CSV logging rates ────────────────────────────────────────
 #define LOG_HZ_SHORT          8       // ≤600s windows: 8 Hz
 #define LOG_HZ_LONG           4       // >600s windows: 4 Hz
 #define LOG_INTERVAL_SHORT    125     // ms (1000/8)
 #define LOG_INTERVAL_LONG     250     // ms (1000/4)
 
+
+
+// ── Window countdown ─────────────────────────────────────────
+const uint32_t WINDOW_COUNTDOWN_MS = 5000;
 

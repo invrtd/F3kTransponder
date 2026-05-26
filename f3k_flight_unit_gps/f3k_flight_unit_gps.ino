@@ -93,11 +93,7 @@
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <Wire.h>
 #include <LittleFS.h>
-#include <Adafruit_DPS310.h>
-#include <Adafruit_LSM6DSO32.h>
-#include <Adafruit_GPS.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESPAsyncWebServer.h>
 #include "esp_wifi.h"     // for esp_wifi_set_ps() modem sleep
@@ -106,8 +102,9 @@
 #include "html.h"      // embedded HTML for pilot UI and window status pages
 #include "types.h"     // data structures for sensor state and flight state machine
 #include "globals.h"
-//#include "webserver.h" // AsyncWebServer setup and endpoint handlers
-
+#include "sensors.h"    // sensor setup and reading functions
+#include "webserver.h" // AsyncWebServer setup and endpoint handlers
+#include "logger.h"
 // ── Log timestamp helper ──────────────────────────────────────
 // Prints a timestamp prefix before every Serial log line.
 // Format: [HH:MM:SS.mmm] from GPS UTC when fix valid,
@@ -118,79 +115,20 @@ void logts() {
   if (gps_fix) {
     // GPS milliseconds aren't always populated — use seconds only
     Serial.printf("[%02u:%02u:%02u +%07lums] ",
-                  gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds, ms);
+                  gps_hour, gps_minute, gps_second, gps_milliseconds, ms);
   } else {
     Serial.printf("[+%07lums] ", ms);
   }
 }
-float          cal_buf[CAL_BUF_SIZE];
-int            cal_count        = 0;
-unsigned long  cal_start_ms     = 0;
-bool           calibration_done = false;
 
-// ── Batch JSON (double-buffered for async safety) ────────────
-String batch_json_a = "{\"ready\":false}";
-String batch_json_b = "{\"ready\":false}";
-volatile int active_buf = 0;
 
-// ── Runtime mode flags ───────────────────────────────────────
-// tilt_mode can be toggled at runtime via /settilt endpoint
-// regardless of the compile-time DEBUG_TILT_MODE setting.
-// Both mode 1 (tilt angle) and mode 2 (parabola sim) set tilt_mode=true
-// so they share the same calibration-skip and state-machine path.
-// sim_mode tracks the specific mode: 0=normal, 1=tilt angle, 2=parabola sim.
-#if DEBUG_TILT_MODE
-bool    tilt_mode = true;              // start in sim mode if compiled with DEBUG_TILT_MODE 1 or 2
-uint8_t sim_mode  = DEBUG_TILT_MODE;  // matches the compile-time selection
-#else
-bool    tilt_mode = false;
-uint8_t sim_mode  = 0;
-#endif
 
-// ── Scoring formula selection ─────────────────────────────────
-// SCORE_MODE 0 = Secs-Ft: duration_s - throw_height_ft  (window-independent)
-// SCORE_MODE 1 = JoeD V1 formula:
-//   time_score = (duration_s / window_secs)^0.425 * 1000
-//   h <= 100ft: score = time_score + (100 - h)^1.6 * 0.113   (bonus, cap 1100)
-//   h >  100ft: score = time_score - (h - 100)^2.3 * 0.09    (penalty, floor 0)
-uint8_t score_mode = 0;   // default: Secs-Ft — change via /setscore?m=0|1
-// ── WiFi mode ────────────────────────────────────────────────
-bool ap_mode     = false;   // true when running as AP hotspot (no scorer network)
-bool wifi_active = true;    // false while WiFi is off during an active window (AP mode only)
-FlightState prev_flight_state = STATE_CALIBRATING;  // tracks state transitions for AP management
 
-// ── Window countdown ─────────────────────────────────────────
-const uint32_t WINDOW_COUNTDOWN_MS = 5000;  // 5s delay before window opens
 
-// ── Auto-window (AP mode practice feature) ───────────────────
-// When ap_mode is true and a flight is confirmed (LAUNCH_WIN→FLIGHT)
-// with no window open, a window is auto-opened backdated by LAUNCH_WIN_MS
-// so the 5-second launch confirmation period counts as flight time.
-// Duration is set to AUTO_WINDOW_SECS (9:55 = 595s by default).
-// Set to 0 to disable.
-bool          window_countdown_active = false;
-unsigned long window_countdown_start  = 0;
-uint16_t      window_countdown_secs   = 0;   // pending window duration
 
-// ── Pilot session (AP mode data collection) ──────────────────
-struct FlightRecord {
-  uint16_t      flight_num;
-  float         duration_s;
-  float         throw_height_ft;
-  float         peak_alt_ft;
-  float         score;          // mode 0: Secs-Ft — duration_s - throw_height_ft (window-independent)
-                                // mode 1: JoeD V1 — (duration_s/180)^0.425*1000 ± height component
-  unsigned long start_time_ms;  // millis() at GROUND→LAUNCH_WIN (window-relative)
-  unsigned long end_time_ms;    // millis() at landing detection (window-relative)
-};
-const int MAX_FLIGHT_RECORDS = 20;
-FlightRecord flight_records[MAX_FLIGHT_RECORDS];
-int          flight_record_count = 0;
-bool         pilot_window_active = false;   // window started from pilot UI
-uint16_t     pilot_window_secs   = 0;
-unsigned long pilot_window_start_ms = 0;
-String        pilot_download_path = "";     // path of completed sensor log, cleared after download
-#define LOG_DIR          "/logs"
+
+
+
 #define LITTLEFS_FULL_PCT 60         // auto-delete threshold — prune early to avoid pressure
 
 bool          window_active    = false;
@@ -290,72 +228,7 @@ void armWindowCloseTimer(uint32_t delay_ms) {
 void disarmWindowOpenTimer()  { if (_timer_open)  timerStop(_timer_open);  }
 void disarmWindowCloseTimer() { if (_timer_close) timerStop(_timer_close); }
 // Scorer sends 0x21 during prep time so units can auto-open the
-// window even if out of WiFi range when 0x20 would normally fire.
-bool          prep_active      = false;   // countdown running
-unsigned long prep_fire_ms     = 0;       // millis() at which to open window
-uint16_t      prep_window_secs = 0;       // window duration to use when it fires
-uint32_t      prep_window_id   = 0;       // window_id expected with the 0x20
 
-// ── Deferred WiFi shutdown ────────────────────────────────────
-// WiFi is shut down after window open, but not synchronously inside
-// openWindowLog() — that is called from the UDP receive path and
-// server.end() + WiFi.mode(OFF) need the async TCP task on Core 0
-// to fully drain first. A flag defers the actual shutdown to the
-// main loop where a proper yield/delay can be used safely.
-bool          wifi_shutdown_pending = false;
-unsigned long wifi_shutdown_after_ms = 0;  // fire shutdown at this millis()
-unsigned long log_epoch_ms        = 0;   // t_ms=0 reference — set at window open
-unsigned long flight_start_epoch_ms = 0; // millis() at each GROUND→LAUNCH_WIN
-File          log_file;
-bool          log_open           = false;
-volatile int  littlefs_streaming = 0;  // count of active HTTP file streams; LittleFS.end() deferred while > 0
-char          log_path[32];           // e.g. /logs/window_042.csv
-uint16_t      flight_counter   = 0;   // increments each LAUNCH_WIN→FLIGHT
-
-// Announce timer — sends Packet 5 a few times after window closes
-bool          announce_pending   = false;
-uint8_t       announce_count     = 0;
-unsigned long last_announce_ms   = 0;
-uint32_t      announce_file_size = 0;   // cached at window close — avoids LittleFS in sendAnnouncement
-const uint8_t ANNOUNCE_REPEATS   = 5;   // send announcement N times
-const uint32_t ANNOUNCE_INTERVAL_MS = 2000;
-
-// ── Diagnostics ──────────────────────────────────────────────
-unsigned long loop_count    = 0;
-unsigned long busy_us_total = 0;
-unsigned long loop_us_total = 0;
-unsigned long loop_max_us   = 0;
-
-struct DiagSnap {
-  int      rssi_dbm;
-  float    cpu_load_pct;
-  float    loop_avg_us;
-  float    loop_max_us;
-  uint32_t free_heap;
-  int      sample_count;
-} diag = {0, 0, 0, 0, 0, 0};
-
-// ── Timing ───────────────────────────────────────────────────
-unsigned long last_sensor_ms  = 0;
-unsigned long last_imu_ms     = 0;
-unsigned long last_gps_ms     = 0;   // GPS NMEA drain cadence
-unsigned long last_display_ms = 0;
-unsigned long last_udp_ms     = 0;
-unsigned long last_dbg_ms     = 0;
-unsigned long last_diag_ms    = 0;   // 1 Hz diagnostic snapshot — always runs
-
-// Live temperature from DPS310 (updated each sensor read)
-float live_temperature_c = 0.0f;
-
-// ── Globals ──────────────────────────────────────────────────
-Adafruit_DPS310    dps;
-Adafruit_LSM6DSO32 lsm;
-// QT Py ESP32-S3 onboard NeoPixel: GPIO39 (data), GPIO38 (power enable)
-Adafruit_NeoPixel  pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
-AsyncWebServer     server(80);
-WiFiUDP            udp;
-WiFiUDP            udp_win;   // listens on port 5006 for window commands
-WiFiUDP            udp_gps;   // Packet 2 — GPS fix data (port 4211)
 
 // ============================================================
 //  LittleFS — load full config
@@ -405,41 +278,6 @@ void loadConfig() {
                 cfg.window_number);
 }
 
-// ============================================================
-//  Helpers
-// ============================================================
-float pressureToAltitudeFeet(float p) {
-  return 44330.0f * (1.0f - powf(p / SEA_LEVEL_HPA, 0.1903f)) * M_TO_FT;
-}
-
-// ============================================================
-//  IMU read — called at 26 Hz
-// ============================================================
-void readImu() {
-  if (!imu_present) return;
-
-  sensors_event_t accel_event, gyro_event, temp_event;
-  lsm.getEvent(&accel_event, &gyro_event, &temp_event);
-
-  imu.accel_x = accel_event.acceleration.x;
-  imu.accel_y = accel_event.acceleration.y;
-  imu.accel_z = accel_event.acceleration.z;
-  imu.gyro_x  = gyro_event.gyro.x;
-  imu.gyro_y  = gyro_event.gyro.y;
-  imu.gyro_z  = gyro_event.gyro.z;
-
-  // G-force magnitude (total acceleration vector in G)
-  float mag = sqrtf(imu.accel_x * imu.accel_x +
-                    imu.accel_y * imu.accel_y +
-                    imu.accel_z * imu.accel_z);
-  imu.g_force = mag / 9.80665f;
-
-  // Tilt angle from vertical — angle between accel vector and gravity vector
-  // When flat/level, accel_z ≈ -9.8 m/s², tilt ≈ 0°
-  imu.tilt_deg = acosf(fabsf(imu.accel_z) / max(mag, 0.001f)) * 180.0f / PI;
-
-  imu.valid = true;
-}
 
 // ============================================================
 //  UDP packet — 14 bytes, big-endian
@@ -601,100 +439,6 @@ void saveConfig() {
   logts(); Serial.printf("[CFG] Saved window_number=%d\n", cfg.window_number);
 }
 
-// ============================================================
-//  pruneLogsIfNeeded — called from main loop during idle ground state
-//  Deletes AT MOST ONE FILE per call, then sets prune_pending=true if
-//  more work remains. This yields control back to the main loop between
-//  deletions so UDP packets (prep countdown) can be processed.
-//  Blocking for an entire multi-file prune cycle was causing the unit to
-//  miss early prep countdown packets, creating window timing errors.
-//
-//  Priority order:
-//  1. Summary cap: delete oldest summary (+ matching window log) if >16
-//  2. Space threshold: delete oldest window log if usage > LITTLEFS_FULL_PCT
-// ============================================================
-#define MAX_SUMMARIES  16   // keep at most 16 summary files (≈ 2-day contest)
-
-void pruneLogsIfNeeded() {
-  if (!LittleFS.begin(false)) return;
-
-  // ── Check summary count ────────────────────────────────────────
-  {
-    uint16_t nums[64];
-    uint8_t  count = 0;
-    File dir = LittleFS.open(LOG_DIR);
-    if (dir) {
-      File entry = dir.openNextFile();
-      while (entry && count < 64) {
-        String name = String(entry.name());
-        if (name.startsWith("summary_") && name.endsWith(".csv"))
-          nums[count++] = (uint16_t)name.substring(8, 11).toInt();
-        entry = dir.openNextFile();
-      }
-    }
-
-    if (count > MAX_SUMMARIES) {
-      // Find the single lowest-numbered summary to delete this pass
-      uint16_t lowest = 65535;
-      for (int i = 0; i < count; i++)
-        if (nums[i] < lowest) lowest = nums[i];
-
-      char path[48];
-      snprintf(path, sizeof(path), "%s/summary_%03d.csv", LOG_DIR, lowest);
-      if (LittleFS.exists(path)) {
-        LittleFS.remove(path);
-        logts(); Serial.printf("[FS] Pruned old summary: %s (cap=%d)\n", path, MAX_SUMMARIES);
-      }
-      snprintf(path, sizeof(path), "%s/window_%03d.csv", LOG_DIR, lowest);
-      if (LittleFS.exists(path)) {
-        LittleFS.remove(path);
-        logts(); Serial.printf("[FS] Pruned matching window log: %s\n", path);
-      }
-      // More summaries may still exceed cap — reschedule for next loop pass
-      LittleFS.end();
-      prune_pending = true;
-      return;
-    }
-  }
-
-  // ── Check space threshold ──────────────────────────────────────
-  {
-    size_t total    = LittleFS.totalBytes();
-    size_t used     = LittleFS.usedBytes();
-    uint8_t used_pct = (total > 0) ? (uint8_t)(100ULL * used / total) : 0;
-    logts(); Serial.printf("[FS] %d%% used (%u / %u bytes)\n", used_pct, used, total);
-
-    if (used_pct >= LITTLEFS_FULL_PCT) {
-      // Find the single oldest window log to delete this pass
-      File dir = LittleFS.open(LOG_DIR);
-      if (dir) {
-        String   oldest = "";
-        uint16_t lowest = 65535;
-        File entry = dir.openNextFile();
-        while (entry) {
-          String name = String(entry.name());
-          if (name.startsWith("window_") && name.endsWith(".csv")) {
-            uint16_t num = (uint16_t)name.substring(7, 10).toInt();
-            if (num < lowest) { lowest = num; oldest = name; }
-          }
-          entry = dir.openNextFile();
-        }
-        if (oldest.length() > 0) {
-          String full = String(LOG_DIR) + "/" + oldest;
-          LittleFS.remove(full);
-          logts(); Serial.printf("[FS] Deleted %s (space prune)\n", full.c_str());
-          // May still be over threshold — reschedule for next loop pass
-          LittleFS.end();
-          prune_pending = true;
-          return;
-        }
-      }
-    }
-  }
-
-  LittleFS.end();
-  // prune_pending stays false — all done
-}
 
 // ============================================================
 //  calculateScore — unified scoring with selectable formula
@@ -730,436 +474,6 @@ float calculateScore(float dur_s, float throw_height_ft) {
   // Mode 0 — Secs-Ft: duration_s - throw_height_ft (window-independent)
   if (window_secs == 0) return 0.0f;
   return dur_s - throw_height_ft;
-}
-
-// ============================================================
-//  openWindowLog — called when scorer sends window start
-// ============================================================
-void openWindowLog() {
-  if (littlefs_streaming > 0) {
-    logts(); Serial.printf("[LOG] openWindowLog deferred — %d stream(s) still active\n",
-                  littlefs_streaming);
-  }
-
-  cfg.window_number++;
-  // saveConfig() deferred — written after window is stable to avoid blocking here
-  // It will be called from the main loop once wifi_active is confirmed.
-  // For now just update the in-memory value so log_path is correct.
-  snprintf(log_path, sizeof(log_path), "%s/window_%03d.csv", LOG_DIR, cfg.window_number);
-
-  if (log_preopen_done && log_open) {
-    // ── Fast path: log was pre-opened during prep ──────────────
-    // File is already open and headers written. Just reset counters
-    // and anchor the epoch. No filesystem I/O needed here.
-    log_epoch_ms        = window_start_ms;
-    flight_counter      = 0;
-    flight_record_count = 0;
-    log_preopen_done    = false;
-    logts(); Serial.printf("[LOG] Opened %s (pre-opened, fast path)  id=%u  %ds\n",
-                  log_path, window_id, window_secs);
-    if (gps_fix) {
-      logts(); Serial.printf("[TOD] Window open: %02u:%02u:%02u UTC (GPS)\n",
-                    gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds);
-    }
-    disarmWindowOpenTimer();
-    armWindowCloseTimer((uint32_t)window_secs * 1000UL);
-    logts(); Serial.printf("[HW] Close timer armed: %ds\n", window_secs);
-    if (!ap_mode) {
-      wifi_shutdown_pending  = true;
-      wifi_shutdown_after_ms = millis() + 200;
-    }
-    // Defer saveConfig() to after WiFi is stable
-    return;
-  }
-
-  // ── Slow path: open log file now (no pre-open available) ─────
-  if (!LittleFS.begin(false)) {
-    logts(); Serial.println("[LOG] LittleFS mount failed — logging disabled.");
-    window_active = false;  // undo caller's set — openWindowLog failed
-    return;
-  }
-
-  size_t free_bytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-  float  log_rate   = (window_secs > 600) ? 1200.0f : 2400.0f;
-  size_t needed     = max((size_t)204800, (size_t)(window_secs * log_rate));
-  if (free_bytes < needed) {
-    logts(); Serial.printf("[LOG] !!! Insufficient space: %u free, need ~%u — logging disabled !!!\n",
-                  free_bytes, needed);
-    LittleFS.end();
-    window_active = false;  // undo caller's set — openWindowLog failed
-    return;
-  }
-
-  if (!LittleFS.exists(LOG_DIR)) LittleFS.mkdir(LOG_DIR);
-
-  log_file = LittleFS.open(log_path, "w");
-  if (!log_file) {
-    logts(); Serial.printf("[LOG] Failed to open %s\n", log_path);
-    LittleFS.end();
-    window_active = false;  // undo caller's set — openWindowLog failed
-    return;
-  }
-
-  // Write context and column headers
-  {
-    char ctx[160];
-    if (contest_round_num > 0) {
-      snprintf(ctx, sizeof(ctx), "# Round %u, Group %u | Task: %s (task_id=%u) | Window: %us | Unit: %u\n",
-               contest_round_num, contest_group_num,
-               taskName(contest_task_id), contest_task_id,
-               window_secs, flight.unit_id);
-    } else {
-      snprintf(ctx, sizeof(ctx), "# Task: %s (task_id=%u) | Window: %us | Unit: %u\n",
-               taskName(contest_task_id), contest_task_id,
-               window_secs, flight.unit_id);
-    }
-    log_file.print(ctx);
-  }
-  log_file.print("t_ms,flight,flight_t_s,state,throw_height_ft,alt_ft,alt_tared_ft,pressure_hpa,temp_c,"
-                 "ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,g_total,tilt_deg,"
-                 "gps_lat,gps_lon,gps_alt_m,gps_sats\n");
-
-  log_open            = true;
-  log_preopen_done    = false;
-  log_epoch_ms        = window_start_ms;
-  flight_counter      = 0;
-  flight_record_count = 0;
-  logts(); Serial.printf("[LOG] Opened %s  id=%u  %ds window  free=%u bytes\n",
-                log_path, window_id, window_secs,
-                (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()));
-  if (gps_fix) {
-    logts(); Serial.printf("[TOD] Window open: %02u:%02u:%02u UTC (GPS)\n",
-                  gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds);
-  }
-  disarmWindowOpenTimer();
-  armWindowCloseTimer((uint32_t)window_secs * 1000UL);
-  logts(); Serial.printf("[HW] Close timer armed: %ds\n", window_secs);
-
-  if (!ap_mode) {
-    wifi_shutdown_pending  = true;
-    wifi_shutdown_after_ms = millis() + 200;
-  }
-}
-
-// ============================================================
-//  logSample — writes one CSV row (called at 8 Hz when window active)
-// ============================================================
-void logSample(float alt_ft, float pressure_hpa, float temp_c) {
-  if (!log_open) return;
-
-  // t_ms relative to window open (log_epoch_ms)
-  unsigned long t_rel = millis() - log_epoch_ms;
-
-  // Periodic flush every 8 seconds (64 samples) to ensure data reaches flash.
-  // Without this, a full filesystem causes silent write failures that leave
-  // the file at 0 bytes — the buffer is never committed.
-  static uint16_t flush_counter = 0;
-  if (++flush_counter >= 64) {
-    flush_counter = 0;
-    log_file.flush();
-    // Check if filesystem has run out of space by comparing file size to
-    // what we expect — if size stopped growing, disable logging gracefully.
-    if (t_rel > 10000 && log_file.size() < 1000) {
-      logts(); Serial.println("[LOG] !!! Write failure detected — filesystem likely full. Disabling logging.");
-      log_file.close();
-      LittleFS.end();
-      log_open = false;
-      return;
-    }
-  }
-
-  // Flight elapsed time in seconds (000.0 format)
-  // Only counts when in LAUNCH_WIN or FLIGHT — 0.0 otherwise
-  float flight_t_s = 0.0f;
-  if (flight.state == STATE_LAUNCH_WIN || flight.state == STATE_FLIGHT) {
-    flight_t_s = flight.flight_duration_ms / 1000.0f;
-  }
-
-  char row[290];   // enlarged from 220 to fit GPS columns
-  snprintf(row, sizeof(row),
-           "%lu,%d,%07.1f,%d,%.3f,%.3f,%.3f,%.4f,%.2f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,%.2f",
-           t_rel,
-           flight_counter,
-           flight_t_s,
-           (int)flight.state,
-           flight.throw_height_ft,
-           alt_ft,
-           alt_ft - tare_baseline_ft,
-           pressure_hpa,
-           temp_c,
-           imu.valid ? imu.accel_x / 9.80665f : 0.0f,
-           imu.valid ? imu.accel_y / 9.80665f : 0.0f,
-           imu.valid ? imu.accel_z / 9.80665f : 0.0f,
-           imu.valid ? imu.gyro_x * 180.0f / PI : 0.0f,
-           imu.valid ? imu.gyro_y * 180.0f / PI : 0.0f,
-           imu.valid ? imu.gyro_z * 180.0f / PI : 0.0f,
-           imu.valid ? imu.g_force : 0.0f,
-           imu.valid ? imu.tilt_deg : 0.0f);
-  log_file.print(row);
-
-  // GPS columns — only written when a valid fix exists on this sample.
-  // Empty fields (,,,) when no fix or no module: correct CSV null semantics
-  // and avoids ~96 KB of 0,0,0,0 zeros per 10-min window with no GPS.
-  // lat=0/lon=0 would be a real coordinate (Gulf of Guinea) so we never
-  // write numeric zeros here.
-  if (gps_fix) {
-    char gps_suffix[64];
-    snprintf(gps_suffix, sizeof(gps_suffix),
-             ",%.6f,%.6f,%.1f,%u",
-             gps_lat, gps_lon, gps_alt_m, gps_sats);
-    log_file.print(gps_suffix);
-  } else {
-    log_file.print(",,,");   // empty lat, lon, alt_m, sats — 4 columns, 3 commas
-  }
-  log_file.print('\n');
-}
-
-// ============================================================
-//  writeSummaryLog — writes score summary CSV after window ends
-//  Columns: Flight#, Start(ms), End(ms), Duration(s),
-//            LaunchHeight(ft), JoeD_Score, SecsMinusFt_Score
-//  Last row: totals
-// ============================================================
-void writeSummaryLog() {
-  if (!LittleFS.begin(false)) return;
-
-  // Path mirrors sensor log: summary_NNN.csv
-  char sum_path[36];
-  snprintf(sum_path, sizeof(sum_path), "%s/summary_%03d.csv", LOG_DIR, cfg.window_number);
-
-  File f = LittleFS.open(sum_path, "w");
-  if (!f) {
-    logts(); Serial.printf("[SUMMARY] Failed to open %s\n", sum_path);
-    LittleFS.end();
-    return;
-  }
-
-  // Context comment header — matches window CSV format for easy cross-reference
-  {
-    char ctx[160];
-    if (contest_round_num > 0) {
-      snprintf(ctx, sizeof(ctx), "# Round %u, Group %u | Task: %s (task_id=%u) | Window: %us | Unit: %u\n",
-               contest_round_num, contest_group_num,
-               taskName(contest_task_id), contest_task_id,
-               window_secs, flight.unit_id);
-    } else {
-      snprintf(ctx, sizeof(ctx), "# Task: %s (task_id=%u) | Window: %us | Unit: %u\n",
-               taskName(contest_task_id), contest_task_id,
-               window_secs, flight.unit_id);
-    }
-    f.print(ctx);
-  }
-
-  // Column header
-  f.print("flight_num,start_ms,end_ms,duration_s,launch_height_ft,joed_score,secsft_score\n");
-
-  float total_dur     = 0;
-  float total_height  = 0;
-  float total_joed    = 0;
-  float total_secsft  = 0;
-
-  for (int i = 0; i < flight_record_count; i++) {
-    FlightRecord& r = flight_records[i];
-
-    // Always compute both scores regardless of current mode
-    float joed_score = 0;
-    {
-      const float JOED_TMAX = 180.0f;
-      float tr = constrain(r.duration_s / JOED_TMAX, 0.0f, 1.0f);
-      float st = powf(tr, 0.425f) * 1000.0f;
-      float h  = r.throw_height_ft;
-      float fs;
-      if (h <= 100.0f) fs = st + powf(100.0f - h, 1.6f) * 0.113f;
-      else             fs = st - powf(h - 100.0f, 2.3f) * 0.09f;
-      joed_score = constrain(fs, 0.0f, 1100.0f);
-    }
-    float secsft_score = r.duration_s - r.throw_height_ft;
-
-    char row[120];
-    snprintf(row, sizeof(row), "%u,%lu,%lu,%.1f,%.1f,%.1f,%.1f\n",
-             r.flight_num,
-             r.start_time_ms,
-             r.end_time_ms,
-             r.duration_s,
-             r.throw_height_ft,
-             joed_score,
-             secsft_score);
-    f.print(row);
-
-    total_dur    += r.duration_s;
-    total_height += r.throw_height_ft;
-    total_joed   += joed_score;
-    total_secsft += secsft_score;
-  }
-
-  // Totals row — "T" in flight_num column
-  // joed total = average (window score); secsft total = sum
-  // Guard against divide-by-zero when no flights were scored
-  float avg_height = flight_record_count > 0 ? total_height / flight_record_count : 0.0f;
-  float avg_joed   = flight_record_count > 0 ? total_joed   / flight_record_count : 0.0f;
-  char totals[120];
-  snprintf(totals, sizeof(totals), "T,,,%.1f,%.1f,%.1f,%.1f\n",
-           total_dur,
-           avg_height,
-           avg_joed,
-           total_secsft);
-  f.print(totals);
-
-  f.flush();
-  uint32_t sz = f.size();
-  f.close();
-  LittleFS.end();
-
-  logts(); Serial.printf("[SUMMARY] Written %s  %u bytes  %d flights\n",
-                sum_path, sz, flight_record_count);
-}
-
-// ============================================================
-//  closeWindowLog — flush and close, trigger announcement
-// ============================================================
-void closeWindowLog() {
-  // Always clear window state — even if no log file was open. The Timeout
-  // fallback in loop() re-calls this every iteration while window_active
-  // remains true; an earlier early-return-on-!log_open bypassed these
-  // three assignments and produced infinite [WIN] Timeout fallback spam,
-  // and blocked all subsequent 0x21 prep packets (0x21 is ignored while
-  // window_active is true). The "already set false at top" comment below
-  // (line ~1181) documents the original intent.
-  window_active        = false;
-  window_close_pending = false;  // clear ISR flag — we're handling it now
-  disarmWindowCloseTimer();      // stop the window timeout check immediately
-
-  if (!log_open) return;
-
-  // ── Capture close timestamp FIRST — before any blocking I/O ──
-  // This is the authoritative window-end time used for scoring.
-  // Everything after this point is housekeeping.
-  window_close_ms = millis();
-
-  // Record in-progress flight at exact close time
-  if ((flight.state == STATE_FLIGHT || flight.state == STATE_LAUNCH_WIN) &&
-      flight_record_count < MAX_FLIGHT_RECORDS) {
-    float dur = flight.flight_duration_ms / 1000.0f;
-    float score = calculateScore(dur, flight.throw_height_ft);
-    flight_records[flight_record_count++] = {
-      (uint16_t)flight_counter,
-      dur,
-      flight.throw_height_ft,
-      flight.peak_alt_ft,
-      score,
-      (unsigned long)max(0L, (long)(flight_start_epoch_ms - log_epoch_ms)),
-      window_close_ms - log_epoch_ms
-    };
-    logts(); Serial.printf("[SCORE] Window close — flight #%d still airborne: dur=%.1fs score=%.1f\n",
-                  flight_counter, dur, score);
-  }
-
-  log_file.flush();
-  uint32_t file_size = log_file.size();
-  announce_file_size = file_size;   // cache for sendAnnouncement() — avoids LittleFS reopens
-  log_file.close();
-  LittleFS.end();
-  log_open = false;
-  // window_active already set false at top of closeWindowLog()
-
-  // Cancel any pending deferred WiFi shutdown — it was scheduled for an
-  // in-flight AP-off transition. Now that the window is closing we are
-  // about to restart the AP ourselves, and we must not let the deferred
-  // executor fire afterwards and silently kill it again.
-  if (wifi_shutdown_pending) {
-    wifi_shutdown_pending = false;
-    logts(); Serial.println("[PWR] Cancelled pending WiFi shutdown at window close");
-  }
-
-  // Make sensor log available for pilot download
-  pilot_download_path = String(log_path);
-
-  logts(); Serial.printf("[LOG] Closed %s  %u bytes\n", log_path, file_size);
-  if (gps_fix) {
-    logts(); Serial.printf("[TOD] Window close: %02u:%02u:%02u UTC (GPS)\n",
-                  gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds);
-  }
-
-  if (file_size == 0) {
-    logts(); Serial.println("!!! WARNING: Log file is empty — possible LittleFS error !!!");
-  }
-
-  // Write score summary CSV
-  writeSummaryLog();
-
-  // Schedule deferred filesystem cleanup. Running pruneLogsIfNeeded() here
-  // would block closeWindowLog() for hundreds of milliseconds (directory
-  // scans + multiple file deletes) while WiFi is restarting — risks WDT.
-  // The main loop services this flag only when in idle GROUND state.
-  prune_pending = true;
-
-  // Restart WiFi after window close so scorer can retrieve the log.
-  // AP mode: restart the hotspot.
-  // STA mode: reconnect to F3KBase so announcements and log retrieval work.
-  if (ap_mode) {
-    char ap_ssid[24];
-    snprintf(ap_ssid, sizeof(ap_ssid), "F3K-Unit-%02d", cfg.unit_id);
-    IPAddress ap_ip(192, 168, cfg.unit_id, 1);
-    IPAddress ap_gateway(192, 168, cfg.unit_id, 1);
-    IPAddress ap_subnet(255, 255, 255, 0);
-    logts(); Serial.println("[PWR] closeWindowLog: calling WiFi.mode(WIFI_AP)...");
-    WiFi.mode(WIFI_AP);
-    logts(); Serial.println("[PWR] closeWindowLog: calling softAPConfig...");
-    WiFi.softAPConfig(ap_ip, ap_gateway, ap_subnet);
-    logts(); Serial.printf("[PWR] closeWindowLog: calling softAP(%s)...\n", ap_ssid);
-    bool ap_ok = WiFi.softAP(ap_ssid);
-    logts(); Serial.printf("[PWR] closeWindowLog: softAP returned %s\n", ap_ok ? "OK" : "FAILED");
-    delay(500);
-    logts(); Serial.printf("[PWR] closeWindowLog: AP IP = %s  clients = %d\n",
-                  WiFi.softAPIP().toString().c_str(), WiFi.softAPgetStationNum());
-    logts(); Serial.println("[PWR] closeWindowLog: calling server.begin()...");
-    server.begin();
-    wifi_active = true;
-    logts(); Serial.printf("[PWR] WiFi ON — AP ready: %s  http://%s/pilot\n",
-                  ap_ssid, WiFi.softAPIP().toString().c_str());
-  } else {
-    // STA mode — reconnect to scorer network with static IP
-    WiFi.mode(WIFI_STA);
-    IPAddress sta_ip(192, 168, 8, cfg.unit_id);
-    IPAddress sta_gateway(192, 168, 8, 1);
-    IPAddress sta_subnet(255, 255, 255, 0);
-    IPAddress sta_dns(192, 168, 8, 1);
-    WiFi.config(sta_ip, sta_gateway, sta_subnet, sta_dns);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    // Don't block here — announcements will fire once WiFi.status()==WL_CONNECTED
-    // The loop's announce handler checks wifi_active before sending
-    wifi_active = false;  // will be set true when connection is confirmed in loop
-    logts(); Serial.printf("[PWR] WiFi reconnecting to %s as 192.168.8.%d...\n",
-                  WIFI_SSID, cfg.unit_id);
-  }
-
-  // Trigger announcement packets.
-  // In STA mode: if WiFi is currently active AND not mid-shutdown, send all
-  // ANNOUNCE_REPEATS announcements immediately (100ms apart) before this
-  // window's state is overwritten by a possible back-to-back openWindowLog()
-  // call (e.g. when 0x20 arrives immediately after 0x21 fires).
-  // If WiFi is down or a shutdown is already pending (radio about to go off),
-  // fall back to the deferred loop path which fires once WiFi reconnects.
-  if (!ap_mode && wifi_active && !wifi_shutdown_pending) {
-    logts(); Serial.printf("[LOG] Sending %d immediate announcements for window_%03d\n",
-                  ANNOUNCE_REPEATS, cfg.window_number);
-    for (uint8_t i = 0; i < ANNOUNCE_REPEATS; i++) {
-      announce_count = i;
-      sendAnnouncement();
-      if (i < ANNOUNCE_REPEATS - 1) delay(100);
-    }
-    announce_pending = false;
-    announce_count   = 0;
-  } else {
-    // WiFi not yet up or shutdown pending — defer to loop as before
-    logts(); Serial.printf("[LOG] Deferring announcements for window_%03d (wifi_active=%s pending=%s)\n",
-                  cfg.window_number,
-                  wifi_active           ? "Y" : "N",
-                  wifi_shutdown_pending ? "Y" : "N");
-    announce_pending  = true;
-    announce_count    = 0;
-    last_announce_ms  = 0;  // fire immediately on next loop pass
-  }
 }
 
 // ============================================================
@@ -1250,10 +564,10 @@ void checkWindowCommand(unsigned long now) {
 
     if (gps_fix) {
       // Compute GPS ms since midnight UTC
-      uint32_t gps_ms = ((uint32_t)gps_sensor.hour   * 3600000UL)
-                      + ((uint32_t)gps_sensor.minute  *   60000UL)
-                      + ((uint32_t)gps_sensor.seconds *    1000UL)
-                      + ((uint32_t)gps_sensor.milliseconds);
+      uint32_t gps_ms = ((uint32_t)gps_hour   * 3600000UL)
+                      + ((uint32_t)gps_minute  *   60000UL)
+                      + ((uint32_t)gps_second *    1000UL)
+                      + ((uint32_t)gps_milliseconds);
       int32_t  delta_ms = (int32_t)scorer_ms - (int32_t)gps_ms;
 
       // Format both as HH:MM:SS.mmm
@@ -1484,7 +798,7 @@ void updateStateMachine(float alt_ft) {
                       flight.flight_duration_ms / 1000.0f, flight_counter);
         if (gps_fix) {
           logts(); Serial.printf("[TOD] Flight #%d launch: %02u:%02u:%02u UTC (GPS)\n",
-                        flight_counter, gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds);
+                        flight_counter, gps_hour, gps_minute, gps_second);
         }
 
         // ── Auto-window (AP mode practice feature) ────────────
@@ -1681,7 +995,7 @@ void updateStateMachine(float alt_ft) {
                       flight.flight_duration_ms / 1000.0f, flight.peak_alt_ft);
         if (gps_fix) {
           logts(); Serial.printf("[TOD] Landing: %02u:%02u:%02u UTC (GPS)\n",
-                        gps_sensor.hour, gps_sensor.minute, gps_sensor.seconds);
+                        gps_hour, gps_minute, gps_second);
         }
         break;
       }
@@ -1874,6 +1188,7 @@ void setup() {
   logts(); Serial.printf("[BOOT] Reset reason: %s\n",
                 reason < 11 ? reason_str[reason] : "OTHER");
   logts(); Serial.printf("[BOOT] Build: %s %s\n", __DATE__, __TIME__);
+
 #if DEBUG_TILT_MODE == 1
   logts(); Serial.println("*** DEBUG TILT MODE 1 — altitude simulated from tilt angle ***");
   logts(); Serial.println("  Flat(0-15°)=GROUND(0ft)  Tilted(15-45°)=LAUNCH(10ft)  Side(45-90°)=FLIGHT(tilt°=ft)");
@@ -1891,130 +1206,23 @@ void setup() {
   setCpuFrequencyMhz(cfg.cpu_mhz);
   logts(); Serial.printf("CPU: %d MHz\n", getCpuFrequencyMhz());
 
-  // -- I2C port selection (controlled by USE_STEMMA_QT define) --
-#if USE_STEMMA_QT
-  Wire1.begin();                // STEMMA QT JST bus (SDA=41, SCL=40)
-  Wire1.setClock(400000);       // DPS310 + LSM6DSO32 + PA1010D all on Wire1
-  logts(); Serial.println("I2C: STEMMA QT port  Wire1 (SDA=41, SCL=40)  400kHz");
-#else
-  Wire.begin();                 // Standard pads (SDA=8, SCL=9)
-  Wire.setClock(400000);
-  logts(); Serial.println("I2C: Standard port  Wire (SDA=8, SCL=9)  400kHz");
-#endif
-#if USE_STEMMA_QT
-  if (!dps.begin_I2C(0x77, &Wire1)) {
-#else
-  if (!dps.begin_I2C(0x77, &Wire)) {
-#endif
-    // DPS310 not found on first try — retry up to 10 times with 500ms gap.
-    // Occasional I2C glitch at power-on can cause a false miss.
-    logts(); Serial.print("DPS310 not found — retrying");
-    // Enable NeoPixel power and init for status indication
-    pinMode(NEOPIXEL_POWER, OUTPUT);
-    digitalWrite(NEOPIXEL_POWER, HIGH);
-    pixel.begin();
-    pixel.setBrightness(40);
+  // -- Sensors --
+  // DPS310 barometer
+  sensors_init_barometer();
 
-    bool dps_ok = false;
-    for (int attempt = 1; attempt <= 10 && !dps_ok; attempt++) {
-      logts(); Serial.printf(" %d", attempt);
-      delay(500);
-      pixel.setPixelColor(0, pixel.Color(50, 20, 0));  // amber — retrying
-      pixel.show();
-#if USE_STEMMA_QT
-      dps_ok = dps.begin_I2C(0x77, &Wire1);
-#else
-      dps_ok = dps.begin_I2C(0x77, &Wire);
-#endif
-      pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-      pixel.show();
-    }
-    logts(); Serial.println();
-
-    if (!dps_ok) {
-      // All retries exhausted — flash red 5 times then continue without DPS310.
-      // Unit will boot, connect to WiFi, and send altitude=0 in all packets.
-      // Scoring is disabled (no altitude data) but logging infrastructure works.
-      logts(); Serial.println("ERROR: DPS310 not found after 10 attempts — continuing without altimeter.");
-      logts(); Serial.println("  Check STEMMA QT cable. Unit will operate with altitude=0.");
-      for (int i = 0; i < 5; i++) {
-        pixel.setPixelColor(0, pixel.Color(80, 0, 0));  // red
-        pixel.show(); delay(200);
-        pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-        pixel.show(); delay(200);
-      }
-      dps_present      = false;
-      calibration_done = true;    // skip calibration — no sensor
-      tare_baseline_ft = 0.0f;
-      flight.state     = STATE_GROUND;
-    } else {
-      dps_present = true;
-      logts(); Serial.println("DPS310 OK (on retry)");
-      dps.configurePressure(DPS310_8HZ, DPS310_8SAMPLES);
-      dps.configureTemperature(DPS310_8HZ, DPS310_8SAMPLES);
-      // Brief green flash to confirm recovery
-      pixel.setPixelColor(0, pixel.Color(0, 60, 0));
-      pixel.show(); delay(300);
-      pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-      pixel.show();
-    }
-  } else {
-    dps_present = true;
-    logts(); Serial.println("DPS310 OK");
-    dps.configurePressure(DPS310_8HZ, DPS310_8SAMPLES);
-    dps.configureTemperature(DPS310_8HZ, DPS310_8SAMPLES);
+  // If no barometer, skip calibration and allow the unit to boot.
+  // sensors.cpp owns the DPS object and dps_present flag.
+  if (!dps_present) {
+    calibration_done = true;
+    tare_baseline_ft = 0.0f;
+    flight.state     = STATE_GROUND;
   }
 
-  // -- LSM6DSO32 IMU --
-#if USE_STEMMA_QT
-  if (!lsm.begin_I2C(0x6A, &Wire1)) {
-#else
-  if (!lsm.begin_I2C(0x6A, &Wire)) {
-#endif
-    logts(); Serial.println("WARNING: LSM6DSO32 not found — IMU data unavailable.");
-    logts(); Serial.println("  Check STEMMA QT chain. Unit will continue without IMU.");
-    imu_present = false;
-  } else {
-    imu_present = true;
-    logts(); Serial.println("LSM6DSO32 OK");
-    // ±32G accelerometer range — suits high-G launch events
-    lsm.setAccelRange(LSM6DSO32_ACCEL_RANGE_32_G);
-    // 26 Hz output data rate
-    lsm.setAccelDataRate(LSM6DS_RATE_26_HZ);
-    lsm.setGyroDataRate(LSM6DS_RATE_26_HZ);
-    // ±2000 dps gyro range
-    lsm.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS);
-    logts(); Serial.printf("  Accel: ±32G  Gyro: ±2000dps  Rate: 26Hz\n");
-  }
+  // LSM6DSO32 IMU
+  sensors_init_imu();
 
-  // -- PA1010D GPS — Wire1 (STEMMA QT), address 0x10 --
-  // GPS is non-fatal: unit continues without it, matching IMU behaviour.
-  // Wire1 is already begun above; gps_sensor holds a reference to it.
-  // NOTE: PA1010D can clock-stretch Wire1 for 30-65ms while processing
-  // NMEA data, causing loop-max spikes. A future custom board should put
-  // GPS on a dedicated I2C bus to isolate it from the scoring sensors.
-  gps_sensor.begin(GPS_I2C_ADDR);
-  // RMC + GGA gives us: fix quality, sats, HDOP, lat, lon, MSL altitude
-  gps_sensor.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-  // 1 Hz update — GPS is background telemetry, not timing-critical
-  gps_sensor.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-  // Probe: begin() on I2C always succeeds, so check for readable bytes
-  delay(200);
-  if (gps_sensor.available() > 0) {
-    gps_present = true;
-    logts(); Serial.println("PA1010D GPS OK");
-  } else {
-    // Second chance — module may need an extra moment after power-on
-    delay(800);
-    if (gps_sensor.available() > 0) {
-      gps_present = true;
-      logts(); Serial.println("PA1010D GPS OK (delayed)");
-    } else {
-      gps_present = false;
-      logts(); Serial.println("WARNING: PA1010D GPS not found — unit will continue without GPS.");
-      logts(); Serial.println("  Check STEMMA QT chain after LSM6DSO32.");
-    }
-  }
+  // PA1010D GPS
+  sensors_init_gps();
 
   // -- WiFi — STA mode (scorer network) or AP mode (direct phone access) --
   delay(1000);
@@ -2031,7 +1239,6 @@ void setup() {
 #else
   // Try to connect to scorer network
   WiFi.mode(WIFI_STA);
-  // Static IP: 192.168.8.unit_id — dedicated subnet, no DHCP needed
   IPAddress sta_ip(192, 168, 8, cfg.unit_id);
   IPAddress sta_gateway(192, 168, 8, 1);
   IPAddress sta_subnet(255, 255, 255, 0);
@@ -2039,6 +1246,7 @@ void setup() {
   WiFi.config(sta_ip, sta_gateway, sta_subnet, sta_dns);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   logts(); Serial.printf("Connecting to %s as 192.168.8.%d", WIFI_SSID, cfg.unit_id);
+
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start > 15000) {
@@ -2046,36 +1254,38 @@ void setup() {
       ap_mode = true;
       break;
     }
-    delay(500); Serial.print(".");
+    delay(500);
+    Serial.print(".");
   }
   logts(); Serial.println();
 #endif
 
   if (ap_mode) {
-    // ── AP mode — unit is the hotspot ──────────────────────────
     WiFi.mode(WIFI_AP);
-    // Custom subnet: 192.168.XX.0 where XX = unit_id
-    // e.g. unit 42 → gateway 192.168.42.1, unit 7 → 192.168.7.1
+
     IPAddress ap_ip(192, 168, cfg.unit_id, 1);
     IPAddress ap_gateway(192, 168, cfg.unit_id, 1);
     IPAddress ap_subnet(255, 255, 255, 0);
+
     WiFi.softAPConfig(ap_ip, ap_gateway, ap_subnet);
     WiFi.softAP(ap_ssid);   // open network, no password
     delay(500);
+
     logts(); Serial.printf("AP mode: SSID=%s  IP=%s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
     logts(); Serial.printf("Browse to: http://%s/pilot\n", WiFi.softAPIP().toString().c_str());
     logts(); Serial.println("Scorer UDP: DISABLED (AP mode)");
-    // No modem sleep in AP mode — radio must stay active for connections
   } else {
-    // ── STA mode — connected to scorer network ─────────────────
     logts(); Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
     logts(); Serial.printf("UDP scorer → %s:%d\n", SERVER_IP, UDP_PORT);
     logts(); Serial.printf("UDP debug  → %s:%d\n", SERVER_IP, UDP_DBG_PORT);
+
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     logts(); Serial.println("Modem sleep: ENABLED (WIFI_PS_MIN_MODEM)");
+
     udp.begin(UDP_PORT);
-    udp_gps.begin(4211);   // Packet 2 — GPS fix
+    udp_gps.begin(4211);
     udp_win.begin(WiFi.broadcastIP(), UDP_WIN_PORT);
+
     logts(); Serial.printf("UDP window listener on port %d (broadcast: %s)\n",
                   UDP_WIN_PORT, WiFi.broadcastIP().toString().c_str());
   }
@@ -2091,611 +1301,28 @@ void setup() {
     LittleFS.end();
   }
 
-  if (ap_mode) cfg.web_enabled = true;  // pilot UI always needs the web server
+  if (ap_mode) cfg.web_enabled = true;
 
-  // -- Async web server (optional — controlled by web_enabled config flag) --
-  // Log endpoints always registered — scorer needs them regardless of web_enabled
-  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest* req){
-    String ip = ap_mode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                  "<title>F3K Unit " + String(flight.unit_id) + " Logs</title>"
-                  "<style>body{font-family:monospace;background:#1a1a1a;color:#e0e0e0;padding:20px;}"
-                  "h2{color:#4db8ff;}table{border-collapse:collapse;width:100%;max-width:600px;}"
-                  "th{background:#2a2a2a;color:#4db8ff;padding:8px 12px;text-align:left;border-bottom:2px solid #4db8ff;}"
-                  "td{padding:7px 12px;border-bottom:1px solid #333;}"
-                  "tr:hover td{background:#2a2a2a;}"
-                  "a{color:#66ffaa;text-decoration:none;}a:hover{text-decoration:underline;}"
-                  ".empty{color:#ff6666;}.size{color:#ffcc44;}</style></head><body>"
-                  "<h2>F3K Unit " + String(flight.unit_id) + " — Flight Logs</h2>";
 
-    if (LittleFS.begin(false)) {
-      File dir = LittleFS.open(LOG_DIR);
-      // Collect entries
-      struct LogEntry { String name; size_t size; };
-      LogEntry entries[50];
-      int count = 0;
-      if (dir) {
-        File entry = dir.openNextFile();
-        while (entry && count < 50) {
-          String name = String(entry.name());
-          if (name.endsWith(".csv")) {
-            entries[count++] = { name, entry.size() };
-          }
-          entry = dir.openNextFile();
-        }
-      }
-      LittleFS.end();
 
-      if (count == 0) {
-        html += "<p>No log files found.</p>";
-      } else {
-        // ── Sensor logs ──────────────────────────────────────────
-        html += "<h3 style='color:#4db8ff;margin:0 0 0.5rem;'>Sensor Logs</h3>"
-                "<table><tr><th>#</th><th>File</th><th>Size</th><th>Download</th><th>Delete</th></tr>";
-        int row = 0;
-        for (int i = 0; i < count; i++) {
-          String name = entries[i].name;
-          if (!name.startsWith("window_")) continue;
-          String num = name.substring(7, 10);
-          String url = "http://" + ip + "/log?n=" + num;
-          String sizeStr = entries[i].size == 0
-            ? "<span class='empty'>0 bytes (empty)</span>"
-            : "<span class='size'>" + String(entries[i].size) + " bytes</span>";
-          html += "<tr><td>" + String(++row) + "</td>"
-                  "<td>" + name + "</td>"
-                  "<td>" + sizeStr + "</td>"
-                  "<td><a href='" + url + "' download='" +
-                  "unit" + String(flight.unit_id) + "_" + name +
-                  "'>⬇</a></td>"
-                  "<td><a href='#' onclick=\"delFile('" + name + "',this)\" "
-                  "style='color:#ff6666;'>✕</a></td></tr>";
-        }
-        if (row == 0) html += "<tr><td colspan='5'>No sensor logs found.</td></tr>";
-        html += "</table>";
-
-        // ── Score summaries ───────────────────────────────────────
-        html += "<h3 style='color:#66ffaa;margin:1.2rem 0 0.5rem;'>Score Summaries</h3>"
-                "<table><tr><th>#</th><th>File</th><th>Size</th><th>Download</th><th>Delete</th></tr>";
-        int srow = 0;
-        for (int i = 0; i < count; i++) {
-          String name = entries[i].name;
-          if (!name.startsWith("summary_")) continue;
-          String num = name.substring(8, 11);
-          String url = "http://" + ip + "/summary?n=" + num;
-          String sizeStr = entries[i].size == 0
-            ? "<span class='empty'>0 bytes (empty)</span>"
-            : "<span class='size'>" + String(entries[i].size) + " bytes</span>";
-          html += "<tr><td>" + String(++srow) + "</td>"
-                  "<td>" + name + "</td>"
-                  "<td>" + sizeStr + "</td>"
-                  "<td><a href='" + url + "' download='" +
-                  "unit" + String(flight.unit_id) + "_" + name +
-                  "'>⬇</a></td>"
-                  "<td><a href='#' onclick=\"delFile('" + name + "',this)\" "
-                  "style='color:#ff6666;'>✕</a></td></tr>";
-        }
-        if (srow == 0) html += "<tr><td colspan='5'>No summaries found.</td></tr>";
-        html += "</table>"
-                "<p style='color:#666;font-size:0.8em;margin-top:0.8rem;'>"
-                "Tap ✕ to delete a file &mdash; tap again to confirm.</p>"
-                "<p style='margin-top:1.5rem;'>"
-                "<a href='#' onclick=\"wipeAll(this);return false;\" "
-                "style='display:inline-block;padding:8px 16px;background:#3a1a1a;"
-                "color:#ff6666;border:1px solid #ff6666;border-radius:4px;"
-                "text-decoration:none;font-weight:bold;'>"
-                "Delete All Logs</a></p>";
-      }
-    } else {
-      html += "<p style='color:#ff6666'>LittleFS unavailable.</p>";
-    }
-
-    html += "<p style='color:#666;margin-top:20px;font-size:0.85em'>"
-            "Unit " + String(flight.unit_id) + " &nbsp;|&nbsp; "
-            "Window " + String(cfg.window_number) + " &nbsp;|&nbsp; "
-            "Free heap: " + String(ESP.getFreeHeap()) + " bytes</p>"
-            "<script>"
-            "function delFile(name,el){"
-            "  if(el.dataset.confirm!='1'){"
-            "    el.dataset.confirm='1';"
-            "    el.textContent='Sure?';"
-            "    el.style.color='#ffaa00';"
-            "    setTimeout(()=>{if(el.dataset.confirm==='1'){"
-            "      el.dataset.confirm='0';el.textContent='✕';el.style.color='#ff6666';"
-            "    }},3000);"
-            "    return;"
-            "  }"
-            "  fetch('/delete?f='+encodeURIComponent(name))"
-            "  .then(r=>{"
-            "    if(r.status===503){"
-            "      el.dataset.confirm='0';el.textContent='Busy';el.style.color='#ffaa00';"
-            "      setTimeout(()=>{el.textContent='✕';el.style.color='#ff6666';},2000);"
-            "      return;"
-            "    }"
-            "    if(r.ok){"
-            "      el.closest('tr').style.opacity='0.3';"
-            "      el.textContent='✓';el.style.color='#3fb950';"
-            "    } else { el.textContent='ERR'; }"
-            "  }).catch(()=>{el.textContent='ERR';});"
-            "}"
-            "function wipeAll(el){"
-            "  var s=el.dataset.stage||'0';"
-            "  if(s==='0'){"
-            "    el.dataset.stage='1';"
-            "    el.textContent='Are you sure?';"
-            "    el.style.background='#5a2a2a';"
-            "    setTimeout(()=>{if(el.dataset.stage==='1'){"
-            "      el.dataset.stage='0';el.textContent='Delete All Logs';el.style.background='#3a1a1a';"
-            "    }},3000);"
-            "    return;"
-            "  }"
-            "  if(s==='1'){"
-            "    el.dataset.stage='2';"
-            "    el.textContent='Really wipe ALL?';"
-            "    el.style.background='#7a2a2a';"
-            "    setTimeout(()=>{if(el.dataset.stage==='2'){"
-            "      el.dataset.stage='0';el.textContent='Delete All Logs';el.style.background='#3a1a1a';"
-            "    }},3000);"
-            "    return;"
-            "  }"
-            "  fetch('/wipe-logs?confirm=YES&extra=SURE')"
-            "  .then(r=>r.text())"
-            "  .then(t=>{"
-            "    el.textContent=t;el.style.background='#1a3a1a';el.style.color='#3fb950';"
-            "    setTimeout(()=>location.reload(),1500);"
-            "  }).catch(()=>{el.textContent='ERR';el.style.color='#ff6666';});"
-            "}"
-            "</script>"
-            "</body></html>";
-
-    req->send(200, "text/html", html);
-  });
-
-  // /delete?f=filename — delete a log or summary file by name
-  server.on("/delete", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!req->hasParam("f")) {
-      req->send(400, "text/plain", "Missing parameter: f");
-      return;
-    }
-    // Refuse to delete while any file stream is active — deleting a file
-    // mid-stream corrupts the transfer and can panic LittleFS.
-    if (littlefs_streaming > 0) {
-      req->send(503, "text/plain", "File transfer in progress — retry shortly");
-      return;
-    }
-    String name = req->getParam("f")->value();
-    // Safety: only allow deletion of window_ and summary_ csv files
-    if ((!name.startsWith("window_") && !name.startsWith("summary_")) ||
-        !name.endsWith(".csv")) {
-      req->send(403, "text/plain", "Not permitted");
-      return;
-    }
-    String path = String(LOG_DIR) + "/" + name;
-    if (!LittleFS.begin(false)) {
-      req->send(503, "text/plain", "LittleFS unavailable");
-      return;
-    }
-    bool removed = false;
-    if (LittleFS.exists(path)) {
-      LittleFS.remove(path);
-      removed = true;
-      logts(); Serial.printf("[LOG] Deleted via UI: %s\n", path.c_str());
-    }
-    if (littlefs_streaming <= 0) LittleFS.end();
-    if (removed) {
-      req->send(200, "text/plain", "Deleted");
-    } else {
-      req->send(404, "text/plain", "Not found");
-    }
-  });
-
-  // /wipe-logs — delete ALL window_*.csv and summary_*.csv files
-  // Escape hatch when FS is full and openWindowLog can't start a new log.
-  // Requires confirm=YES AND extra=SURE (matched in the UI by a 3-click
-  // confirm pattern) so a single fat-fingered request can't wipe in error.
-  // Refuses while any file is streaming or a window is currently open.
-  server.on("/wipe-logs", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!req->hasParam("confirm") || req->getParam("confirm")->value() != "YES" ||
-        !req->hasParam("extra")   || req->getParam("extra")->value()   != "SURE") {
-      req->send(400, "text/plain", "Missing safety params (need confirm=YES&extra=SURE)");
-      return;
-    }
-    if (littlefs_streaming > 0) {
-      req->send(503, "text/plain", "File transfer in progress — retry shortly");
-      return;
-    }
-    if (window_active) {
-      req->send(503, "text/plain", "Window active — wipe refused");
-      return;
-    }
-    if (!LittleFS.begin(false)) {
-      req->send(503, "text/plain", "LittleFS unavailable");
-      return;
-    }
-    // Collect names first — deleting mid-iteration is unsafe on LittleFS.
-    // Heap-allocated so we don't drop 4-8KB on the AsyncTCP task stack.
-    const int MAX_FILES = 256;
-    String* victims = new (std::nothrow) String[MAX_FILES];
-    if (!victims) {
-      if (littlefs_streaming <= 0) LittleFS.end();
-      req->send(500, "text/plain", "Out of memory");
-      return;
-    }
-    int n = 0;
-    bool overflowed = false;
-    File dir = LittleFS.open(LOG_DIR);
-    if (dir) {
-      File entry = dir.openNextFile();
-      while (entry) {
-        String name = String(entry.name());
-        if ((name.startsWith("window_") || name.startsWith("summary_")) &&
-            name.endsWith(".csv")) {
-          if (n < MAX_FILES) {
-            victims[n++] = name;
-          } else {
-            overflowed = true;
-            break;
-          }
-        }
-        entry = dir.openNextFile();
-      }
-    }
-    uint16_t deleted = 0;
-    for (int i = 0; i < n; i++) {
-      String path = String(LOG_DIR) + "/" + victims[i];
-      if (LittleFS.remove(path)) deleted++;
-    }
-    delete[] victims;
-    if (littlefs_streaming <= 0) LittleFS.end();
-    logts(); Serial.printf("[LOG] WIPE: deleted %u files via UI%s\n",
-                  deleted, overflowed ? " (more remain — click again)" : "");
-    String msg = "Deleted " + String(deleted) + " files";
-    if (overflowed) msg += " (more remain — click again)";
-    req->send(200, "text/plain", msg);
-  });
-
-  // /pilot — pilot data collection page (AP mode)
-  server.on("/pilot", HTTP_GET, [](AsyncWebServerRequest* req){
-    req->send_P(200, "text/html", PILOT_HTML);
-  });
-
-  // /wstatus — window status page (AP mode, served during active window)
-  // Redirects to /pilot when no window is active.
-  // Data is injected inline as window.__WS__ — no polling endpoint needed.
-  server.on("/wstatus", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!window_active) {
-      req->redirect("/pilot");
-      return;
-    }
-
-    // Build window.__WS__ JSON inline — all values already in RAM,
-    // no LittleFS reads except log_file.size() which is a metadata call
-    // on the already-open file handle (fast, non-blocking).
-    uint32_t elapsed_s = (millis() - window_start_ms) / 1000;
-
-    String js = "<script>window.__WS__={";
-    js += "unit_id:"     + String(cfg.unit_id)                           + ",";
-    js += "elapsed_s:"   + String(elapsed_s)                             + ",";
-    js += "win_secs:"    + String(window_secs)                           + ",";
-    js += "log_open:"    + String(log_open ? "true" : "false")           + ",";
-    js += "log_name:\""  + String(log_open ? log_path : "")              + "\",";
-    js += "log_bytes:"   + String(log_open ? log_file.size() : 0)        + ",";
-    js += "flight_count:" + String(flight_record_count)                  + ",";
-    js += "gps_present:" + String(gps_present ? "true" : "false")        + ",";
-    js += "gps_fix:"     + String(gps_fix     ? "true" : "false")        + ",";
-    js += "gps_sats:"    + String(gps_sats)                              + ",";
-    js += "flights:[";
-    for (int i = 0; i < flight_record_count; i++) {
-      if (i > 0) js += ",";
-      js += "{num:"      + String(flight_records[i].flight_num)          + ",";
-      js += "dur:"       + String(flight_records[i].duration_s,    1)    + ",";
-      js += "throw_ft:"  + String(flight_records[i].throw_height_ft, 1)  + ",";
-      js += "peak_ft:"   + String(flight_records[i].peak_alt_ft,   1)    + ",";
-      js += "score:"     + String(flight_records[i].score,         1)    + "}";
-    }
-    js += "]}</script>";
-
-    // Inject the data script into the PROGMEM HTML by sending in two parts
-    String page = String(FPSTR(WSTATUS_HTML));
-    page.replace("<script>", js + "<script>");
-    req->send(200, "text/html", page);
-  });
-
-  // /setscore?m=0|1 — select scoring formula at runtime
-  // m=0: Secs-Ft  duration_s - throw_height_ft, window score = sum
-  // m=1: JoeD V1 (dur/180)^0.425*1000 ± height component, window score = average
-  server.on("/setscore", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (req->hasParam("m")) {
-      uint8_t m = req->getParam("m")->value().toInt();
-      if (m == 0 || m == 1) {
-        score_mode = m;
-        logts(); Serial.printf("[SCORE] Formula: %s\n",
-                      score_mode == 1 ? "JoeD V1 (avg of flights)" : "Secs-Ft (sum of flights)");
-      }
-    }
-    req->send(200, "application/json",
-              String("{\"score_mode\":") + score_mode + "}");
-  });
-
-  // /settilt?v=0|1|2 — select input mode at runtime
-  // v=0: Normal (real sensors, full calibration)
-  // v=1: Tilt sim (altitude from IMU tilt angle)
-  // v=2: Parabola sim (autonomous flight cycles, no physical input needed)
-  server.on("/settilt", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (req->hasParam("v")) {
-      uint8_t newSim = (uint8_t)constrain(req->getParam("v")->value().toInt(), 0, 2);
-      if (newSim != sim_mode) {
-        sim_mode  = newSim;
-        tilt_mode = (sim_mode > 0);
-        // Reset calibration state for any mode change
-        calibration_done   = false;
-        cal_start_ms       = 0;
-        cal_count          = 0;
-        last_landed_alt_ft = 0.0f;  // reset so throw height is clean after mode switch
-        if (!tilt_mode) {
-          // Returning to normal — full barometric recalibration
-          flight.state = STATE_CALIBRATING;
-        }
-        const char* modeNames[] = {"Normal", "Tilt Sim", "Parabola Sim"};
-        logts(); Serial.printf("[MODE] Input mode: %s\n", modeNames[sim_mode]);
-      }
-    }
-    req->send(200, "application/json",
-              String("{\"sim_mode\":") + sim_mode +
-              ",\"tilt_mode\":"       + (tilt_mode ? "true" : "false") + "}");
-  });
-
-  // /pstatus — lightweight JSON for pilot page (1 Hz polling)
-  server.on("/pstatus", HTTP_GET, [](AsyncWebServerRequest* req){
-    // Total score — sum for linear, average for JoeD V1
-    float total_score = 0;
-    if (flight_record_count > 0) {
-      for (int i = 0; i < flight_record_count; i++) total_score += flight_records[i].score;
-      if (score_mode == 1) total_score /= flight_record_count;  // JoeD V1: average
-    }
-
-    String j = "{";
-    j += "\"unit_id\":"    + String(flight.unit_id)                         + ",";
-    j += "\"state\":"      + String((int)flight.state)                      + ",";
-    j += "\"state_name\":\"" + String(stateNames[flight.state])             + "\",";
-    j += "\"flight_num\":" + String(flight_counter)                         + ",";
-    j += "\"flight_t\":"   + String(flight.flight_duration_ms/1000.0f, 1)  + ",";
-    j += "\"throw_ht\":"   + String(flight.throw_height_ft, 1)              + ",";
-    j += "\"alt_tared\":"  + String(flight.altitude_ft - tare_baseline_ft, 1) + ",";
-    j += "\"win_active\":" + String(window_active ? "true" : "false")       + ",";
-    j += "\"win_secs\":"   + String(window_secs)                            + ",";
-    j += "\"prep_active\":" + String(prep_active ? "true" : "false")        + ",";
-    j += "\"prep_remain\":" + String(prep_active ? max(0L, (long)(prep_fire_ms - millis()) / 1000 + 1) : 0) + ",";
-    j += "\"countdown\":"  + String(window_countdown_active ? "true" : "false") + ",";
-    j += "\"countdown_remain\":";
-    if (window_countdown_active) {
-      uint32_t elapsed = millis() - window_countdown_start;
-      uint32_t remain  = elapsed < WINDOW_COUNTDOWN_MS ? (WINDOW_COUNTDOWN_MS - elapsed) / 1000 + 1 : 0;
-      j += String(remain);
-    } else {
-      j += "0";
-    }
-    j += ",";
-    j += "\"log_ready\":"     + String((!window_active && pilot_download_path.length() > 0) ? "true" : "false") + ",";
-    j += "\"log_num\":"       + String(cfg.window_number)                      + ",";
-    j += "\"tilt_mode\":"  + String(tilt_mode ? "true" : "false")          + ",";
-    j += "\"sim_mode\":"   + String(sim_mode)                               + ",";
-    j += "\"score_mode\":" + String(score_mode)                              + ",";
-    j += "\"wifi_active\":" + String((wifi_active && !wifi_shutdown_pending) ? "true" : "false") + ",";
-    j += "\"total_score\":" + String(total_score, 1)                        + ",";
-    j += "\"flights\":[";
-    for (int i = 0; i < flight_record_count; i++) {
-      if (i > 0) j += ",";
-      j += "{\"num\":"   + String(flight_records[i].flight_num)       + ",";
-      j += "\"dur\":"    + String(flight_records[i].duration_s, 1)    + ",";
-      j += "\"throw\":"  + String(flight_records[i].throw_height_ft, 1) + ",";
-      j += "\"peak\":"   + String(flight_records[i].peak_alt_ft, 1)   + ",";
-      j += "\"score\":"  + String(flight_records[i].score, 1)         + "}";
-    }
-    j += "]}";
-    req->send(200, "application/json", j);
-  });
-
-  // /pgps — GPS debug JSON for the GPS tab (1 Hz polling)
-  server.on("/pgps", HTTP_GET, [](AsyncWebServerRequest* req){
-    String j = "{";
-    j += "\"present\":"     + String(gps_present    ? "true" : "false") + ",";
-    j += "\"fix\":"         + String(gps_fix         ? "true" : "false") + ",";
-    j += "\"fix_quality\":" + String(gps_fix_quality)                   + ",";
-    j += "\"satellites\":"  + String(gps_sats)                          + ",";
-    j += "\"hdop\":"        + String(gps_hdop, 1)                       + ",";
-    j += "\"lat\":"         + String(gps_lat,  6)                       + ",";
-    j += "\"lon\":"         + String(gps_lon,  6)                       + ",";
-    j += "\"alt_m\":"       + String(gps_alt_m, 1)                      + "}";
-    req->send(200, "application/json", j);
-  });
-
-  // /pstart?secs=NNN — start a window from pilot UI (5s countdown then opens)
-  server.on("/pstart", HTTP_GET, [](AsyncWebServerRequest* req){
-    uint16_t secs = 300;
-    if (req->hasParam("secs")) secs = req->getParam("secs")->value().toInt();
-    secs = constrain(secs, 30, 3600);
-    if (window_active) closeWindowLog();
-    flight_record_count      = 0;
-    pilot_download_path      = "";
-    window_countdown_secs    = secs;
-    window_countdown_start   = millis();
-    window_countdown_active  = true;
-    logts(); Serial.printf("[WIN] Countdown started: %ds window in %ds\n",
-                  secs, WINDOW_COUNTDOWN_MS / 1000);
-    req->send(200, "text/plain", "OK");
-  });
-
-  // /pstop — end window early or cancel countdown
-  server.on("/pstop", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (window_countdown_active) {
-      window_countdown_active = false;
-      logts(); Serial.println("[WIN] Countdown cancelled");
-    } else if (window_active) {
-      logts(); Serial.println("[WIN] Pilot stopped window early");
-      closeWindowLog();
-    }
-    req->send(200, "text/plain", "OK");
-  });
-  // /summary?n=NNN — serve score summary CSV (kept on device for historical reference)
-  server.on("/summary", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!LittleFS.begin(false)) {
-      req->send(503, "text/plain", "LittleFS unavailable");
-      return;
-    }
-    int num = req->hasParam("n") ? req->getParam("n")->value().toInt() : cfg.window_number;
-    char spath[36];
-    snprintf(spath, sizeof(spath), "%s/summary_%03d.csv", LOG_DIR, num);
-    if (!LittleFS.exists(spath)) {
-      LittleFS.end();
-      req->send(404, "text/plain", "Summary not found");
-      return;
-    }
-    AsyncWebServerResponse* resp = req->beginResponse(LittleFS, spath, "text/csv");
-    char cd[72];
-    snprintf(cd, sizeof(cd), "attachment; filename=\"unit%02d_summary_%03d.csv\"",
-             flight.unit_id, num);
-    resp->addHeader("Content-Disposition", cd);
-    resp->addHeader("Connection", "close");
-    // Increment stream counter before sending; decrement in onDisconnect.
-    // LittleFS stays mounted until the last active stream completes.
-    // Also disable modem sleep for the duration — WIFI_PS_MIN_MODEM pauses
-    // the radio mid-transfer at ~204KB causing IncompleteRead on the scorer.
-    littlefs_streaming++;
-    if (littlefs_streaming == 1) esp_wifi_set_ps(WIFI_PS_NONE);
-    req->onDisconnect([](){
-      if (--littlefs_streaming <= 0) {
-        littlefs_streaming = 0;
-        LittleFS.end();
-        if (!window_active) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-      }
-    });
-    req->send(resp);
-    logts(); Serial.printf("[SUMMARY] Served %s\n", spath);
-  });
-
-  // /log?n=NNN&del=1 — serve CSV, optionally delete after download
-  server.on("/log", HTTP_GET, [](AsyncWebServerRequest* req){
-    if (!req->hasParam("n")) {
-      req->send(400, "text/plain", "Missing parameter: n");
-      return;
-    }
-    // Guard: if the log file is still open (window just closed, still flushing)
-    // return 503 so the scorer's retry queue handles it gracefully.
-    if (log_open) {
-      req->send(503, "text/plain", "Log still open — retry shortly");
-      return;
-    }
-    String num = req->getParam("n")->value();
-    bool del_after = req->hasParam("del") && req->getParam("del")->value() == "1";
-    while (num.length() < 3) num = "0" + num;
-    String path = String(LOG_DIR) + "/window_" + num + ".csv";
-
-    if (!LittleFS.begin(false)) {
-      logts(); Serial.println("[LOG] HTTP: LittleFS mount failed");
-      req->send(503, "text/plain", "LittleFS unavailable");
-      return;
-    }
-    if (!LittleFS.exists(path)) {
-      logts(); Serial.printf("[LOG] HTTP: file not found: %s\n", path.c_str());
-      LittleFS.end();
-      req->send(404, "text/plain", "Log not found: " + path);
-      return;
-    }
-    logts(); Serial.printf("[LOG] Serving %s → %s%s\n",
-                  path.c_str(), req->client()->remoteIP().toString().c_str(),
-                  del_after ? " (delete after)" : "");
-    AsyncWebServerResponse* response = req->beginResponse(LittleFS, path, "text/csv");
-    response->addHeader("Content-Disposition",
-                        "attachment; filename=\"unit" + String(flight.unit_id) +
-                        "_window_" + num + ".csv\"");
-    response->addHeader("Connection", "close");
-    littlefs_streaming++;
-    if (littlefs_streaming == 1) esp_wifi_set_ps(WIFI_PS_NONE);
-    if (del_after) {
-      String pathCopy = path;
-      req->onDisconnect([pathCopy](){
-        if (--littlefs_streaming <= 0) {
-          littlefs_streaming = 0;
-          if (LittleFS.begin(false)) {
-            LittleFS.remove(pathCopy);
-            logts(); Serial.printf("[LOG] Deleted %s after download\n", pathCopy.c_str());
-            LittleFS.end();
-          }
-          if (!window_active) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        }
-        pilot_download_path = "";
-      });
-    } else {
-      req->onDisconnect([](){
-        if (--littlefs_streaming <= 0) {
-          littlefs_streaming = 0;
-          LittleFS.end();
-          if (!window_active) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        }
-      });
-    }
-    req->send(response);
-  });
-
-  // /debug — full telemetry overlay (used by pilot page telemetry tab)
-  server.on("/debug", HTTP_GET, [](AsyncWebServerRequest* req){
-    req->send_P(200, "text/html", PAGE_HTML);
-  });
-
-  if (cfg.web_enabled) {
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest* req){
-      req->send_P(200, "text/html", PAGE_HTML);
-    });
-    server.on("/json", HTTP_GET, [](AsyncWebServerRequest* req){
-      const String& json = (active_buf == 0) ? batch_json_a : batch_json_b;
-      req->send(200, "application/json", json);
-    });
-    server.on("/tare", HTTP_GET, [](AsyncWebServerRequest* req){
-      tare_requested = true;
-      req->send(200, "text/plain", "OK");
-    });
-    server.onNotFound([](AsyncWebServerRequest* req){
-      req->send(404, "text/plain", "Not found");
-    });
-    server.begin();
-    if (ap_mode) {
-      logts(); Serial.printf("Web (AP): http://%s/\n", WiFi.softAPIP().toString().c_str());
-    } else {
-      logts(); Serial.printf("Web overlay: http://%s/\n", WiFi.localIP().toString().c_str());
-    }
-  } else {
-    // Start server anyway for log endpoints — just no debug overlay
-    server.onNotFound([](AsyncWebServerRequest* req){
-      req->send(404, "text/plain", "Not found");
-    });
-    server.begin();
-    if (ap_mode) {
-      logts(); Serial.printf("Log server (AP): http://%s/logs\n", WiFi.softAPIP().toString().c_str());
-    } else {
-      logts(); Serial.printf("Log server: http://%s/logs  (log retrieval: /log?n=NNN)\n", WiFi.localIP().toString().c_str());
-      logts(); Serial.println("Web overlay: DISABLED (field mode)");
-    }
-  }
+  setupWebServer();
 
   last_sensor_ms  = millis();
   last_imu_ms     = millis() + 20;
-  last_diag_ms    = millis() + 500;            // first diag after 0.5s
+  last_diag_ms    = millis() + 500;
   last_udp_ms     = millis();
   last_dbg_ms     = millis() + DISPLAY_OFFSET_MS;
   last_display_ms = millis() + DISPLAY_OFFSET_MS;
 
   // ── Hardware timers ──────────────────────────────────────────
-  // Timer 2: window open (armed from prep countdown, fires ISR to latch timestamp)
-  // Timer 3: window close (armed at window open, fires ISR to latch timestamp)
-  // v3.x API: timerBegin(freq_hz) — 1000 Hz = 1 ms resolution.
-  // timerAttachInterrupt takes only (timer, ISR) — no edge parameter.
   _timer_open  = timerBegin(1000);
   timerAttachInterrupt(_timer_open,  &onWindowOpenTimer);
+
   _timer_close = timerBegin(1000);
   timerAttachInterrupt(_timer_close, &onWindowCloseTimer);
+
   logts(); Serial.println("[HW] Window timers ready (Timer_open  Timer_close  1ms tick)");
 }
-
 // ============================================================
 //  loop()
 // ============================================================
@@ -2739,50 +1366,37 @@ void loop() {
   // ── IMU read at 26 Hz ────────────────────────────────────
   if (now - last_imu_ms >= IMU_INTERVAL) {
     last_imu_ms = now;
-    readImu();
+    sensors_read_imu();
     did_work = true;
   }
 
   // ── GPS — drain NMEA buffer and parse (non-blocking) ─────
-  // read() pulls one byte at a time from Wire1. GPS outputs at 1 Hz,
-  // so polling every 100ms is more than sufficient to catch every
-  // sentence. Polling at 20ms was causing 50 Wire1 requestFrom calls
-  // per second — increasing contention with the IMU and DPS310 on
-  // the shared bus, and increasing the frequency of GPS clock-stretch
-  // events hitting the loop timing.
+  // Sensor module owns the PA1010D object and updates gps_* globals.
   if (gps_present && (now - last_gps_ms >= 100)) {
     last_gps_ms = now;
-    for (int i = 0; i < 32; i++) gps_sensor.read();
-    if (gps_sensor.newNMEAreceived()) {
-      if (gps_sensor.parse(gps_sensor.lastNMEA())) {
-        gps_fix_quality = gps_sensor.fixquality;
-        gps_fix         = (gps_fix_quality > 0);
-        if (gps_fix) {
-          gps_lat   = gps_sensor.latitudeDegrees  * (gps_sensor.lat  == 'N' ? 1.0f : -1.0f);
-          gps_lon   = gps_sensor.longitudeDegrees * (gps_sensor.lon  == 'E' ? 1.0f : -1.0f);
-          gps_alt_m = gps_sensor.altitude;
-          gps_sats  = gps_sensor.satellites;
-          gps_hdop  = gps_sensor.HDOP;
-        }
-        did_work = true;   // only count a parse as real work, not every drain pass
-      }
-    }
-    // did_work intentionally NOT set here for the common no-sentence case
+    sensors_read_gps();
+    // Keep same work-accounting behavior as before: GPS polling is bounded
+    // and only considered useful loop work when a fix is currently valid.
+    if (gps_fix) did_work = true;
   }
 
   // ── Sensor read at 8 Hz ───────────────────────────────────
   if (now - last_sensor_ms >= SENSOR_INTERVAL) {
     last_sensor_ms = now;
+
+    float alt_ft       = 0.0f;
+    float pressure_hpa = SEA_LEVEL_HPA;
+    float temp_c       = dps_temp_c;
+
+    sensors_read_barometer(alt_ft, pressure_hpa, temp_c);
+
     if (!dps_present) {
       // No DPS310 — state machine still needs to run; feed zero altitude
       updateStateMachine(tare_baseline_ft);
       did_work = true;
     } else {
-    sensors_event_t temp_event, pressure_event;
-    dps.getEvents(&temp_event, &pressure_event);
 
-    if (pressure_event.pressure > 800 && pressure_event.pressure < 1100) {
-      float alt_ft = pressureToAltitudeFeet(pressure_event.pressure);
+    if (pressure_hpa > 800 && pressure_hpa < 1100) {
 
       if (tilt_mode) {
         // ── Simulation modes (tilt_mode=true, sim_mode=1 or 2) ───────
@@ -2894,6 +1508,7 @@ void loop() {
             int8_t jitter = (int8_t)(((cfg.unit_id * 7 + sim_flight_idx * 13) % 21) - 10);
             uint16_t dur_s = (uint16_t)constrain((int)target_s + jitter, 5, 599);
             sim_flight_ms  = (uint32_t)dur_s * 1000UL;
+
             // Launch height: 30–60ft, varied by unit_id + flight index
             sim_launch_ft  = 30.0f + (float)((cfg.unit_id * 11 + sim_flight_idx * 17) % 31);
             // Peak: launch height + 20–40ft additional climb
@@ -3002,8 +1617,8 @@ void loop() {
         } else {
           // ── Tilt simulation (mode 1) — altitude from IMU tilt angle ─
           // 0–15° → 0ft (GROUND)  15–45° → 10ft (LAUNCH_WIN)  45–90° → tilt°=ft
-          if (imu.valid) {
-            float t = imu.tilt_deg;
+          if (imu_present) {
+            float t = imu_tilt_deg;
             if      (t < 15.0f) alt_ft = tare_baseline_ft + 0.0f;
             else if (t < 45.0f) alt_ft = tare_baseline_ft + 10.0f;
             else                alt_ft = tare_baseline_ft + t;
@@ -3011,10 +1626,10 @@ void loop() {
         }
 
         flight.altitude_ft = alt_ft;
-        live_temperature_c = temp_event.temperature;
+        dps_temp_c = temp_c;
         if (buf_count < BUF_SIZE) {
-          buf_pressure[buf_count]    = pressure_event.pressure;
-          buf_temperature[buf_count] = temp_event.temperature;
+          buf_pressure[buf_count]    = pressure_hpa;
+          buf_temperature[buf_count] = temp_c;
           buf_count++;
         }
         updateStateMachine(alt_ft);
@@ -3039,14 +1654,14 @@ void loop() {
                           tare_baseline_ft, cal_count);
           }
           flight.altitude_ft = alt_ft;
-          live_temperature_c = temp_event.temperature;
+          dps_temp_c = temp_c;
           updateStateMachine(alt_ft);
         } else {
           flight.altitude_ft = alt_ft;
-          live_temperature_c = temp_event.temperature;
+          dps_temp_c = temp_c;
           if (buf_count < BUF_SIZE) {
-            buf_pressure[buf_count]    = pressure_event.pressure;
-            buf_temperature[buf_count] = temp_event.temperature;
+            buf_pressure[buf_count]    = pressure_hpa;
+            buf_temperature[buf_count] = temp_c;
             buf_count++;
           }
           updateStateMachine(alt_ft);
@@ -3061,7 +1676,7 @@ void loop() {
         static uint8_t log_skip = 0;
         bool do_log = (window_secs <= 600) || ((log_skip++ & 1) == 0);
         if (do_log) {
-          logSample(alt_ft, pressure_event.pressure, temp_event.temperature);
+          logSample(alt_ft, pressure_hpa, temp_c);
         }
       }
 

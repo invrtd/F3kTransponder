@@ -46,3 +46,14 @@ struct ImuData {
   bool  valid;
 } ;
 
+// ── Pilot session (AP mode data collection) ──────────────────
+struct FlightRecord {
+  uint16_t      flight_num;
+  float         duration_s;
+  float         throw_height_ft;
+  float         peak_alt_ft;
+  float         score;          // mode 0: Secs-Ft — duration_s - throw_height_ft (window-independent)
+                                // mode 1: JoeD V1 — (duration_s/180)^0.425*1000 ± height component
+  unsigned long start_time_ms;  // millis() at GROUND→LAUNCH_WIN (window-relative)
+  unsigned long end_time_ms;    // millis() at landing detection (window-relative)
+};
