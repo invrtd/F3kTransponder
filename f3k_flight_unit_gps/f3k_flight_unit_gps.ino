@@ -80,10 +80,10 @@
 //    Adafruit LSM6DS
 //    Adafruit BusIO
 //    Adafruit Unified Sensor
-//    Adafruit GPS Library                              ← add for PA1010D
-//    Adafruit NeoPixel                                 ← for boot status LED
-//    ESPAsyncWebServer (mathieucarbou fork, v3.10.3+)  ← use this fork
-//    AsyncTCP (dvarrel fork, v3.4.10+)                 ← use this fork
+//    Adafruit GPS Library               ← add for PA1010D
+//    Adafruit NeoPixel                  ← for boot status LED
+//    ESP Async WebServer	By ESP32Async  ← use this fork
+//    Async TCP By ESP32Async            ← use this fork
 //
 //  ICD reference: F3K_ICD_v1_7.docx
 //
