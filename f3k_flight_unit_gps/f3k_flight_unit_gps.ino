@@ -61,6 +61,7 @@
 //    /summary?n=N     — serve score summary CSV (kept on device)
 //    /logs            — log browser with download and delete
 //    /delete?f=name   — delete window_NNN.csv or summary_NNN.csv
+//    /wipe-logs?confirm=YES&extra=SURE — delete ALL window_*.csv + summary_*.csv (UI escape hatch)
 //    /setscore?m=0|1  — select scoring formula at runtime
 //    /settilt?v=0|1   — toggle tilt mode (triggers recalibration)
 //    /debug           — full telemetry overlay (telemetry tab iframe)
@@ -86,7 +87,7 @@
 //
 //  ICD reference: F3K_ICD_v1_7.docx
 //
-//  Source file CRC32: 1044862F  (computed over all lines except this one)
+//  Source file CRC32: 67A96578  (computed over all lines except this one)
 //  To verify: python3 -c "import binascii; d=open('f3k_flight_unit_gps.ino','rb').read(); lines=[l for l in d.split(b'\n') if b'Source file CRC32' not in l]; print(f'{binascii.crc32(b\"\\n\".join(lines))&0xFFFFFFFF:08X}')"
 // ============================================================
 
@@ -904,6 +905,7 @@ void openWindowLog() {
   // ── Slow path: open log file now (no pre-open available) ─────
   if (!LittleFS.begin(false)) {
     logts(); Serial.println("[LOG] LittleFS mount failed — logging disabled.");
+    window_active = false;  // undo caller's set — openWindowLog failed
     return;
   }
 
@@ -914,6 +916,7 @@ void openWindowLog() {
     logts(); Serial.printf("[LOG] !!! Insufficient space: %u free, need ~%u — logging disabled !!!\n",
                   free_bytes, needed);
     LittleFS.end();
+    window_active = false;  // undo caller's set — openWindowLog failed
     return;
   }
 
@@ -923,6 +926,7 @@ void openWindowLog() {
   if (!log_file) {
     logts(); Serial.printf("[LOG] Failed to open %s\n", log_path);
     LittleFS.end();
+    window_active = false;  // undo caller's set — openWindowLog failed
     return;
   }
 
@@ -1144,15 +1148,23 @@ void writeSummaryLog() {
 //  closeWindowLog — flush and close, trigger announcement
 // ============================================================
 void closeWindowLog() {
+  // Always clear window state — even if no log file was open. The Timeout
+  // fallback in loop() re-calls this every iteration while window_active
+  // remains true; an earlier early-return-on-!log_open bypassed these
+  // three assignments and produced infinite [WIN] Timeout fallback spam,
+  // and blocked all subsequent 0x21 prep packets (0x21 is ignored while
+  // window_active is true). The "already set false at top" comment below
+  // (line ~1181) documents the original intent.
+  window_active        = false;
+  window_close_pending = false;  // clear ISR flag — we're handling it now
+  disarmWindowCloseTimer();      // stop the window timeout check immediately
+
   if (!log_open) return;
 
   // ── Capture close timestamp FIRST — before any blocking I/O ──
   // This is the authoritative window-end time used for scoring.
   // Everything after this point is housekeeping.
   window_close_ms = millis();
-  window_active   = false;
-  window_close_pending = false;  // clear ISR flag — we're handling it now
-  disarmWindowCloseTimer();   // stop the window timeout check immediately
 
   // Record in-progress flight at exact close time
   if ((flight.state == STATE_FLIGHT || flight.state == STATE_LAUNCH_WIN) &&
@@ -3564,7 +3576,13 @@ void setup() {
         if (srow == 0) html += "<tr><td colspan='5'>No summaries found.</td></tr>";
         html += "</table>"
                 "<p style='color:#666;font-size:0.8em;margin-top:0.8rem;'>"
-                "Tap ✕ to delete a file &mdash; tap again to confirm.</p>";
+                "Tap ✕ to delete a file &mdash; tap again to confirm.</p>"
+                "<p style='margin-top:1.5rem;'>"
+                "<a href='#' onclick=\"wipeAll(this);return false;\" "
+                "style='display:inline-block;padding:8px 16px;background:#3a1a1a;"
+                "color:#ff6666;border:1px solid #ff6666;border-radius:4px;"
+                "text-decoration:none;font-weight:bold;'>"
+                "Delete All Logs</a></p>";
       }
     } else {
       html += "<p style='color:#ff6666'>LittleFS unavailable.</p>";
@@ -3597,6 +3615,33 @@ void setup() {
             "      el.textContent='✓';el.style.color='#3fb950';"
             "    } else { el.textContent='ERR'; }"
             "  }).catch(()=>{el.textContent='ERR';});"
+            "}"
+            "function wipeAll(el){"
+            "  var s=el.dataset.stage||'0';"
+            "  if(s==='0'){"
+            "    el.dataset.stage='1';"
+            "    el.textContent='Are you sure?';"
+            "    el.style.background='#5a2a2a';"
+            "    setTimeout(()=>{if(el.dataset.stage==='1'){"
+            "      el.dataset.stage='0';el.textContent='Delete All Logs';el.style.background='#3a1a1a';"
+            "    }},3000);"
+            "    return;"
+            "  }"
+            "  if(s==='1'){"
+            "    el.dataset.stage='2';"
+            "    el.textContent='Really wipe ALL?';"
+            "    el.style.background='#7a2a2a';"
+            "    setTimeout(()=>{if(el.dataset.stage==='2'){"
+            "      el.dataset.stage='0';el.textContent='Delete All Logs';el.style.background='#3a1a1a';"
+            "    }},3000);"
+            "    return;"
+            "  }"
+            "  fetch('/wipe-logs?confirm=YES&extra=SURE')"
+            "  .then(r=>r.text())"
+            "  .then(t=>{"
+            "    el.textContent=t;el.style.background='#1a3a1a';el.style.color='#3fb950';"
+            "    setTimeout(()=>location.reload(),1500);"
+            "  }).catch(()=>{el.textContent='ERR';el.style.color='#ff6666';});"
             "}"
             "</script>"
             "</body></html>";
@@ -3640,6 +3685,71 @@ void setup() {
     } else {
       req->send(404, "text/plain", "Not found");
     }
+  });
+
+  // /wipe-logs — delete ALL window_*.csv and summary_*.csv files
+  // Escape hatch when FS is full and openWindowLog can't start a new log.
+  // Requires confirm=YES AND extra=SURE (matched in the UI by a 3-click
+  // confirm pattern) so a single fat-fingered request can't wipe in error.
+  // Refuses while any file is streaming or a window is currently open.
+  server.on("/wipe-logs", HTTP_GET, [](AsyncWebServerRequest* req){
+    if (!req->hasParam("confirm") || req->getParam("confirm")->value() != "YES" ||
+        !req->hasParam("extra")   || req->getParam("extra")->value()   != "SURE") {
+      req->send(400, "text/plain", "Missing safety params (need confirm=YES&extra=SURE)");
+      return;
+    }
+    if (littlefs_streaming > 0) {
+      req->send(503, "text/plain", "File transfer in progress — retry shortly");
+      return;
+    }
+    if (window_active) {
+      req->send(503, "text/plain", "Window active — wipe refused");
+      return;
+    }
+    if (!LittleFS.begin(false)) {
+      req->send(503, "text/plain", "LittleFS unavailable");
+      return;
+    }
+    // Collect names first — deleting mid-iteration is unsafe on LittleFS.
+    // Heap-allocated so we don't drop 4-8KB on the AsyncTCP task stack.
+    const int MAX_FILES = 256;
+    String* victims = new (std::nothrow) String[MAX_FILES];
+    if (!victims) {
+      if (littlefs_streaming <= 0) LittleFS.end();
+      req->send(500, "text/plain", "Out of memory");
+      return;
+    }
+    int n = 0;
+    bool overflowed = false;
+    File dir = LittleFS.open(LOG_DIR);
+    if (dir) {
+      File entry = dir.openNextFile();
+      while (entry) {
+        String name = String(entry.name());
+        if ((name.startsWith("window_") || name.startsWith("summary_")) &&
+            name.endsWith(".csv")) {
+          if (n < MAX_FILES) {
+            victims[n++] = name;
+          } else {
+            overflowed = true;
+            break;
+          }
+        }
+        entry = dir.openNextFile();
+      }
+    }
+    uint16_t deleted = 0;
+    for (int i = 0; i < n; i++) {
+      String path = String(LOG_DIR) + "/" + victims[i];
+      if (LittleFS.remove(path)) deleted++;
+    }
+    delete[] victims;
+    if (littlefs_streaming <= 0) LittleFS.end();
+    logts(); Serial.printf("[LOG] WIPE: deleted %u files via UI%s\n",
+                  deleted, overflowed ? " (more remain — click again)" : "");
+    String msg = "Deleted " + String(deleted) + " files";
+    if (overflowed) msg += " (more remain — click again)";
+    req->send(200, "text/plain", msg);
   });
 
   // /pilot — pilot data collection page (AP mode)
